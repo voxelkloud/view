@@ -1,4 +1,4 @@
-import type { DecodedPointData } from "@voxelkloud/loader";
+import type { DecodedPointData } from "@voxelkloud/format-potree";
 import {
   BufferAttribute,
   InstancedBufferAttribute,

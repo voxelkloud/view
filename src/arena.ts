@@ -108,8 +108,10 @@ export class PointArena {
   constructor(
     private readonly parent: Group,
     private readonly material: Material,
-    private readonly spacingAt: (level: number) => number,
-    private readonly radiusAt: (level: number) => number,
+    /** POINT PITCH at a level — the world-space size a point is drawn at.
+     *  Never a geometric error: those diverge on non-octree formats. */
+    private readonly pointSpacingAt: (level: number) => number,
+    private readonly boundingRadiusAt: (level: number) => number,
     options: ArenaOptions = {},
     /**
      * Allocate a per-point scalar lane, for the intensity and classification
@@ -346,7 +348,7 @@ export class PointArena {
     mesh.matrixAutoUpdate = false;
     mesh.visible = false;
     mesh.updateMatrix();
-    mesh.userData['spacingWorld'] = this.spacingAt(level);
+    mesh.userData['spacingWorld'] = this.pointSpacingAt(level);
     mesh.userData['level'] = level;
     this.parent.add(mesh);
 
@@ -369,7 +371,7 @@ export class PointArena {
     this.allSlabs.push(slab);
     this.bytes +=
       positions.byteLength + colors.byteLength + (scalars?.byteLength ?? 0);
-    void this.radiusAt;
+    void this.boundingRadiusAt;
     return slab;
   }
 

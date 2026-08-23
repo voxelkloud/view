@@ -54,8 +54,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@voxelkloud/core": "^0.1.0",
-    "@voxelkloud/loader": "^0.1.0"
+    "@voxelkloud/core": "workspace:*",
+    "@voxelkloud/loader": "workspace:*",
+    "@voxelkloud/format-potree": "workspace:*"
   },
   "peerDependencies": {
     "three": "^0.180.0"

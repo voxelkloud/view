@@ -1,15 +1,13 @@
-import type {
-  BrotliDecompress,
-  DecodedAttribute,
-  DecodedPointData,
-  HierarchyNode,
-  LoadPointDataOptions,
-  PointCloudHierarchy,
-  PointCloudSource,
-  PointDataOptions,
-  PointRecordLayout,
-} from "@voxelkloud/loader";
-import { createPointLayout, loadPointData } from "@voxelkloud/loader";
+// FORMAT-SPECIFIC BY CONSTRUCTION, and left that way deliberately.
+//
+// A profile reads node PAYLOADS and reports node NAMES, and both are the
+// driver's vocabulary — `byteSize === 0` is how Potree says a node carries no
+// points of its own, and `r047` is how it names one. Widening the traversal to
+// the neutral tree while the reporting stays Potree would buy nothing and cost
+// a cast at every step. It generalises when the node-payload contract exists,
+// which is Task B2.
+import type { DecodedAttribute, DecodedPointData, NodeDecompress, OpenPointsOptions, PointCloudNode, PointCloudSourceBase, PointCloudTreeBase, PointDataOptions, PointReader, PointReaderFactory, ReadPointsOptions } from "@voxelkloud/core";
+
 import type { PointReadback } from "../sink.js";
 
 export type ProfileVec2 = readonly [number, number];
@@ -103,27 +101,39 @@ export interface ProfileSummaryBatch {
 export type ProfileBatch = ProfilePointBatch | ProfileSummaryBatch;
 
 export interface ProfileCloudContext {
-  readonly source: PointCloudSource;
-  readonly hierarchy: PointCloudHierarchy;
+  readonly source: PointCloudSourceBase;
+  readonly hierarchy: PointCloudTreeBase;
+  /**
+   * The driver's reader factory. Called once per extraction with the attribute
+   * selection the query needs, so a profile that wants only position does not
+   * pay for colour on every node it touches.
+   */
+  readonly openPoints: PointReaderFactory;
   readonly readPoints?: (nodeIndex: number) => PointReadback | undefined;
 }
 
 export interface ProfileExtractionOptions {
   /** Accepted profile points before traversal stops. Default 1,000,000. */
   readonly maxPoints?: number;
-  /** Inclusive octree depth limit. Default: metadata hierarchy depth, or unlimited. */
+  /**
+   * Inclusive octree depth limit. Unlimited by default.
+   *
+   * Was the Potree manifest's declared depth, which no neutral source carries —
+   * and the traversal already stops at a childless node, so the limit is a
+   * caller's budget rather than a safety net.
+   */
   readonly maxDepth?: number;
   /** Materialised/intersecting nodes visited before traversal stops. */
   readonly maxNodes?: number;
   readonly signal?: AbortSignal;
-  readonly decompress?: BrotliDecompress;
-  readonly maxNodeBytes?: number;
+  readonly decompress?: NodeDecompress;
   /**
-   * Decode layout for nodes that are not already resident. Defaults to
-   * position + colour, matching `loadPointData`.
+   * Attribute selection for nodes that are not already resident. Defaults to
+   * position plus colour, the same default a reader takes on its own.
    */
   readonly pointData?: PointDataOptions;
-  readonly layout?: PointRecordLayout;
+  /** A reader to use instead of opening one. Takes precedence over `pointData`. */
+  readonly reader?: PointReader;
   /**
    * Prefer `PointSink.readPoints()` when it has enough data for the request.
    * Enabled by default.
@@ -144,7 +154,7 @@ interface MutableProfileStats {
 }
 
 interface QueueEntry {
-  readonly node: HierarchyNode;
+  readonly node: PointCloudNode;
   readonly distance2: number;
   readonly sequence: number;
 }
@@ -207,21 +217,27 @@ export async function* extractProfile(
     options.maxNodes ?? Number.POSITIVE_INFINITY,
     "maxNodes",
   );
-  const maxDepth = depthLimit(
-    options.maxDepth ?? context.source.metadata.hierarchy.depth,
-  );
+  const maxDepth = depthLimit(options.maxDepth ?? Number.POSITIVE_INFINITY);
   const pointData = options.pointData ?? {};
-  const layout = options.layout ?? createPointLayout(context.source, pointData);
+  const ownsReader = options.reader === undefined;
+  const reader =
+    options.reader ??
+    context.openPoints({
+      ...(pointData as OpenPointsOptions),
+      computeBounds: false,
+      ...(options.decompress !== undefined
+        ? { decompress: options.decompress }
+        : {}),
+    });
   const preferResident =
     (options.preferResident ?? true) &&
     canUseResidentReadback(context.source, pointData);
   const includeResidentColor = shouldEmitResidentColor(context.source, pointData);
-  const loadOptions: LoadPointDataOptions = {
-    ...pointData,
+  // The decompressor is a reader-wide concern, not a per-node one, so it was
+  // handed to `openPoints` above rather than repeated on every read.
+  const loadOptions: ReadPointsOptions = {
     signal: options.signal,
     computeBounds: false,
-    decompress: options.decompress,
-    maxNodeBytes: options.maxNodeBytes,
   };
 
   const started = nowMs();
@@ -299,9 +315,9 @@ export async function* extractProfile(
     } else if (node.numPoints > 0) {
       const data = await loadProfileNode(
         context,
+        reader,
         node,
         loadOptions,
-        layout,
         stats,
         errors,
       );
@@ -435,9 +451,9 @@ function createHorizontalGeometry(
 
 async function loadProfileNode(
   context: ProfileCloudContext,
-  node: HierarchyNode,
-  loadOptions: LoadPointDataOptions,
-  layout: PointRecordLayout,
+  reader: PointReader,
+  node: PointCloudNode,
+  loadOptions: ReadPointsOptions,
   stats: MutableProfileStats,
   errors: ProfileNodeError[],
 ): Promise<DecodedPointData | undefined> {
@@ -447,15 +463,16 @@ async function loadProfileNode(
     loadOptions.signal,
     errors,
   );
-  if (!expanded && node.byteSize === undefined) {
+  const hasPayload = reader.hasPayload(node);
+  // A node that neither expanded nor carries points is a dead end the caller
+  // should know about; one that simply has no payload of its own is normal.
+  if (!expanded && !hasPayload) {
     setLimitedBy(stats, "error");
     return undefined;
   }
-  if (node.byteSize === undefined || node.byteSize === 0 || node.numPoints === 0) {
-    return undefined;
-  }
+  if (!hasPayload) return undefined;
   try {
-    return await loadPointData(context.source, node, loadOptions, layout);
+    return await reader.read(node, loadOptions);
   } catch (error) {
     stats.failedNodes++;
     setLimitedBy(stats, "error");
@@ -468,21 +485,20 @@ async function loadProfileNode(
   }
 }
 
+/**
+ * Make a node's children known, or report why not.
+ *
+ * `childMask !== undefined` is the neutral spelling of "expanded": a driver's
+ * own `state` field is not on the tree contract, and the mask is what the
+ * scheduler keys off too.
+ */
 async function expandProfileNode(
   context: ProfileCloudContext,
-  node: HierarchyNode,
+  node: PointCloudNode,
   signal: AbortSignal | undefined,
   errors: ProfileNodeError[],
 ): Promise<boolean> {
-  if (node.state === "expanded") return true;
-  if (node.state === "failed") {
-    errors.push({
-      nodeIndex: node.index,
-      nodeName: node.name,
-      message: node.failure?.error.message ?? "Hierarchy node failed.",
-    });
-    return false;
-  }
+  if (node.childMask !== undefined) return true;
   if (context.hierarchy.tryExpandSync(node)) return true;
   try {
     await context.hierarchy.expand(node, signal === undefined ? {} : { signal });
@@ -498,8 +514,8 @@ async function expandProfileNode(
 }
 
 function collectReadbackPoints(
-  source: PointCloudSource,
-  node: HierarchyNode,
+  source: PointCloudSourceBase,
+  node: PointCloudNode,
   readback: PointReadback,
   geometry: ProfileGeometry,
   remaining: number,
@@ -507,7 +523,7 @@ function collectReadbackPoints(
   stats: MutableProfileStats,
 ): ProfilePoint[] {
   const points: ProfilePoint[] = [];
-  const origin = source.metadata.boundingBox.min;
+  const origin = source.bounds.min;
   const limit = Math.min(readback.count, remaining);
 
   for (let i = 0; i < readback.count && points.length < limit; i++) {
@@ -646,7 +662,7 @@ function colorAt(
 }
 
 function nodeIntersectsProfile(
-  node: HierarchyNode,
+  node: PointCloudNode,
   geometry: ProfileGeometry,
 ): boolean {
   if (node.maxZ < geometry.zMin || node.minZ > geometry.zMax) return false;
@@ -677,7 +693,7 @@ function nodeIntersectsProfile(
 }
 
 function nodeProfileDistance2(
-  node: HierarchyNode,
+  node: PointCloudNode,
   geometry: ProfileGeometry,
 ): number {
   if (geometry.kind === "horizontal") {
@@ -847,7 +863,7 @@ function rectsOverlap(a: Rect, b: Rect): boolean {
 }
 
 function canUseResidentReadback(
-  source: PointCloudSource,
+  source: PointCloudSourceBase,
   pointData: PointDataOptions,
 ): boolean {
   if (pointData.positionFormat !== undefined && pointData.positionFormat !== "float32") {
@@ -866,7 +882,7 @@ function canUseResidentReadback(
 }
 
 function shouldEmitResidentColor(
-  source: PointCloudSource,
+  source: PointCloudSourceBase,
   pointData: PointDataOptions,
 ): boolean {
   const color = source.attributes.find((a) => a.role === "color")?.name;

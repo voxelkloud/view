@@ -1,4 +1,4 @@
-import type { DecodedPointData } from "@voxelkloud/loader";
+import type { DecodedPointData } from "@voxelkloud/format-potree";
 import { Group, MeshBasicMaterial } from "three/webgpu";
 import { describe, expect, it } from "vitest";
 import { ArenaSink } from "./sink-arena.js";

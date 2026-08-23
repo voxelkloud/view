@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { createPointLayout, parsePointCloudSource } from "@voxelkloud/loader";
-import type { DecodedPointData, PointCloudSource } from "@voxelkloud/loader";
+import { openPotreePoints, parsePointCloudSource } from "@voxelkloud/format-potree";
+import type { DecodedPointData, PointCloudSource } from "@voxelkloud/format-potree";
 import { Group, MeshBasicMaterial } from "three/webgpu";
 import { describe, expect, it } from "vitest";
 import { PointArena } from "./arena.js";
@@ -21,7 +21,7 @@ function autzen(): PointCloudSource {
     JSON.parse(
       readFileSync(
         new URL(
-          "../../loader/src/__fixtures__/autzen.metadata.json",
+          "../../format-potree/src/__fixtures__/autzen.metadata.json",
           import.meta.url,
         ).pathname,
         "utf8",
@@ -31,8 +31,11 @@ function autzen(): PointCloudSource {
   );
 }
 
-function layoutFor(source: PointCloudSource, name: string) {
-  return createPointLayout(source, {
+// `scalarRangeFor` reads the packing off the READER now, not off a layout: the
+// transform has to be whatever the driver's decoder actually applied, and there
+// is no layout object in a neutral view any more.
+function readerFor(source: PointCloudSource, name: string) {
+  return openPotreePoints(source, {
     attributes: [name],
     scalarFormat: "gpu",
     lanes: { [name]: "f32" },
@@ -44,19 +47,18 @@ describe("scalarRangeFor", () => {
     const source = autzen();
     // intensity is uint16 0..254 here, and 2 bytes wide, so Task 2 attaches no
     // normalization and the decoded f32 carries raw counts.
-    expect(scalarRangeFor(source, layoutFor(source, "intensity"), "intensity"))
+    expect(scalarRangeFor(source, readerFor(source, "intensity"), "intensity"))
       .toEqual([0, 254]);
   });
 
-  it("applies the layout's packing transform rather than recomputing it", () => {
+  it("applies the reader's packing transform rather than recomputing it", () => {
     const source = autzen();
-    // gps-time is a double, so Task 2 normalises it to 0..1 and the range must
+    // gps-time is a double, so it is normalised to 0..1 and the range must
     // follow the lane, not the manifest. Handing the shader 245369..249783
     // against a 0..1 value pins every point to the ramp's first stop.
-    const layout = layoutFor(source, "gps-time");
-    const pack = layout.fields.find((f) => f.name === "gps-time")?.pack;
-    expect(pack).toBeDefined();
-    expect(scalarRangeFor(source, layout, "gps-time")).toEqual([0, 1]);
+    const reader = readerFor(source, "gps-time");
+    expect(reader.packingFor("gps-time")).toBeDefined();
+    expect(scalarRangeFor(source, reader, "gps-time")).toEqual([0, 1]);
   });
 
   it("falls back to the 16-bit LAS range on a degenerate declared range", () => {
@@ -71,14 +73,14 @@ describe("scalarRangeFor", () => {
         max: [7],
       }),
     } as PointCloudSource;
-    expect(scalarRangeFor(flat, layoutFor(source, "intensity"), "intensity"))
+    expect(scalarRangeFor(flat, readerFor(source, "intensity"), "intensity"))
       .toEqual([0, 65535]);
   });
 
-  it("is unaffected by an attribute the layout does not carry", () => {
+  it("is unaffected by an attribute the reader does not carry", () => {
     const source = autzen();
     expect(
-      scalarRangeFor(source, layoutFor(source, "intensity"), "classification"),
+      scalarRangeFor(source, readerFor(source, "intensity"), "classification"),
     ).toEqual([1, 2]);
   });
 });

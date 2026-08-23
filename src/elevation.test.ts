@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parsePointCloudSource } from "@voxelkloud/loader";
+import { parsePointCloudSource } from "@voxelkloud/format-potree";
 import { describe, expect, it } from "vitest";
 import { cloudRelativeElevationRange } from "./view.js";
 
@@ -21,7 +21,7 @@ describe("cloudRelativeElevationRange", () => {
   it("rebases the tight Z extent onto the cloud origin", () => {
     const source = sourceFrom(
       new URL(
-        "../../loader/src/__fixtures__/autzen.metadata.json",
+        "../../format-potree/src/__fixtures__/autzen.metadata.json",
         import.meta.url,
       ).pathname,
     );
@@ -42,7 +42,7 @@ describe("cloudRelativeElevationRange", () => {
   it("spans the ramp instead of collapsing it", () => {
     const source = sourceFrom(
       new URL(
-        "../../loader/src/__fixtures__/autzen.metadata.json",
+        "../../format-potree/src/__fixtures__/autzen.metadata.json",
         import.meta.url,
       ).pathname,
     );

@@ -19,6 +19,7 @@ export {
   projectionFactorOrthographic,
   projectionFactorPerspective,
   screenPixelRadius,
+  screenErrorPx,
   screenSpacingPx,
   suggestNearFar,
 } from "./metric.js";
@@ -28,6 +29,7 @@ export { heapPop, heapPush } from "./heap.js";
 export type { HeapArrays } from "./heap.js";
 
 export {
+  DEFAULT_SCREEN_ERROR,
   createLodScratch,
   createLodSelection,
   ensureLodCapacity,

@@ -1,25 +1,29 @@
 import { readFileSync } from "node:fs";
-import {
-  createHierarchy,
-  parsePointCloudSource,
-} from "@voxelkloud/loader";
-import type { PointCloudHierarchy } from "@voxelkloud/loader";
+import { createHierarchy, parsePointCloudSource } from "@voxelkloud/format-potree";
+import type { HierarchyNode, PointCloudHierarchy } from "@voxelkloud/format-potree";
 import { Matrix4, PerspectiveCamera, Vector3 } from "three";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Containment, extractFrustumPlanes } from "./frustum.js";
 import {
+  DEFAULT_SCREEN_ERROR,
   createLodScratch,
   createLodSelection,
   resolveLodOptions,
   selectVisible,
 } from "./select.js";
-import type { LodCameraState, LodScratch, LodSelection, LodTreeView } from "./select.js";
+import type {
+  LodCameraState,
+  LodKernels,
+  LodScratch,
+  LodSelection,
+  LodTreeView,
+} from "./select.js";
 
-// The loader vendors the real autzen manifest and hierarchy for its own offline
+// The Potree driver vendors the real autzen manifest and hierarchy for its own offline
 // suite; reading them here keeps the scheduler tested against real converter
 // output rather than a synthetic tree that cannot reproduce its shape.
 const LOADER_FIXTURES = new URL(
-  "../../../loader/src/__fixtures__/",
+  "../../../format-potree/src/__fixtures__/",
   import.meta.url,
 );
 
@@ -93,8 +97,9 @@ function run(
   s: LodScratch,
   out: LodSelection,
   opts = {},
+  kernels?: LodKernels,
 ): LodSelection {
-  return selectVisible(tree, cam, resolveLodOptions(opts), s, out);
+  return selectVisible(tree, cam, resolveLodOptions(opts), s, out, kernels);
 }
 
 describe("selectVisible over the real autzen hierarchy", () => {
@@ -156,14 +161,14 @@ describe("selectVisible over the real autzen hierarchy", () => {
   });
 
   // The knob the reference ships is inert at its defaults; ours must not be.
-  it("has a targetPixelSpacing that actually changes the selection", () => {
+  it("has a targetScreenError that actually changes the selection", () => {
     const s = createLodScratch();
     const coarse = createLodSelection();
     const fine = createLodSelection();
     const camA = cameraLooking(autzen, 900, s);
-    run(autzen, camA, s, coarse, { targetPixelSpacing: 8, pointBudget: 50_000_000 });
+    run(autzen, camA, s, coarse, { targetScreenError: 8, pointBudget: 50_000_000 });
     const camB = cameraLooking(autzen, 900, s);
-    run(autzen, camB, s, fine, { targetPixelSpacing: 0.5, pointBudget: 50_000_000 });
+    run(autzen, camB, s, fine, { targetScreenError: 0.5, pointBudget: 50_000_000 });
 
     expect(fine.count).toBeGreaterThan(coarse.count);
     expect(fine.points).toBeGreaterThan(coarse.points);
@@ -236,8 +241,8 @@ describe("selectVisible over the real autzen hierarchy", () => {
     run(autzen, cameraLooking(autzen, 400, s), s, out, {
       pointBudget: 50_000_000,
     });
-    expect(out.minSpacingWorld).toBeCloseTo(
-      autzen.spacingAt(out.maxSelectedLevel),
+    expect(out.minPointSpacingWorld).toBeCloseTo(
+      autzen.pointSpacingAt(out.maxSelectedLevel),
       12,
     );
   });
@@ -323,10 +328,266 @@ describe("selectVisible: containment propagation", () => {
     const s = createLodScratch();
     const out = createLodSelection();
     const cam = cameraLooking(autzen, 12_000, s);
-    run(autzen, cam, s, out, { pointBudget: 50_000_000, targetPixelSpacing: 0.1 });
+    run(autzen, cam, s, out, { pointBudget: 50_000_000, targetScreenError: 0.1 });
     expect(out.count).toBeGreaterThan(1);
     // Root is pushed as Intersecting; once a box classifies Inside every
     // descendant inherits it without a six-plane test.
     expect(Containment.Inside).toBe(2);
+  });
+});
+
+// ---- A1/A2/A4: the generalised metric -------------------------------------
+//
+// The point of these is that the SPLIT is real. Two of the three quantities
+// used to be one number, and every test below fails if they are silently
+// re-merged.
+
+/** Wrap a real hierarchy, overriding only what a test names. */
+function view(base: PointCloudHierarchy, over: Partial<LodTreeView>): LodTreeView {
+  return {
+    nodeCount: base.nodeCount,
+    root: base.root,
+    node: (i) => base.node(i),
+    geometricErrorAt: (l) => base.geometricErrorAt(l),
+    pointSpacingAt: (l) => base.pointSpacingAt(l),
+    boundingRadiusAt: (l) => base.boundingRadiusAt(l),
+    // The scheduler speaks the NEUTRAL node; this fixture's tree is a Potree
+    // one, so the narrowing happens here rather than in the contract.
+    tryExpandSync: (n) => base.tryExpandSync(n as HierarchyNode),
+    requestExpand: (n, sig) => base.requestExpand(n as HierarchyNode, sig),
+    ...over,
+  };
+}
+
+/** Dense array holding exactly the closed form, for every materialised node. */
+function denseFromLevel(
+  base: PointCloudHierarchy,
+  at: (level: number) => number,
+): Float64Array {
+  const a = new Float64Array(base.nodeCount);
+  for (let i = 0; i < base.nodeCount; i++) {
+    const n = base.node(i);
+    if (n !== undefined) a[i] = at(n.level);
+  }
+  return a;
+}
+
+describe("per-node overrides (A1)", () => {
+  it("reproduces the closed-form selection EXACTLY when filled with it", () => {
+    // The differential test that makes the whole generalisation safe: the array
+    // path and the closed-form path are the same decision seen two ways, so
+    // filling the arrays with the closed form must be a no-op down to the order
+    // of `indices` — which is also the streaming priority order.
+    const s1 = createLodScratch();
+    const s2 = createLodScratch();
+    const closed = createLodSelection();
+    const dense = createLodSelection();
+
+    run(autzen, cameraLooking(autzen, 600, s1), s1, closed, {
+      pointBudget: 50_000_000,
+    });
+    const overridden = view(autzen, {
+      nodeGeometricError: denseFromLevel(autzen, (l) => autzen.geometricErrorAt(l)),
+      nodePointSpacing: denseFromLevel(autzen, (l) => autzen.pointSpacingAt(l)),
+      nodeBoundingRadius: denseFromLevel(autzen, (l) => autzen.boundingRadiusAt(l)),
+    });
+    run(overridden, cameraLooking(autzen, 600, s2), s2, dense, {
+      pointBudget: 50_000_000,
+    });
+
+    expect(dense.count).toBe(closed.count);
+    expect(dense.points).toBe(closed.points);
+    expect(dense.limitedBy).toBe(closed.limitedBy);
+    expect(dense.maxSelectedLevel).toBe(closed.maxSelectedLevel);
+    expect(dense.minPointSpacingWorld).toBeCloseTo(closed.minPointSpacingWorld, 12);
+    expect(Array.from(dense.indices.subarray(0, dense.count))).toEqual(
+      Array.from(closed.indices.subarray(0, closed.count)),
+    );
+  });
+
+  it("actually binds: halving every node's error coarsens the selection", () => {
+    const s1 = createLodScratch();
+    const s2 = createLodScratch();
+    const normal = createLodSelection();
+    const halved = createLodSelection();
+
+    run(autzen, cameraLooking(autzen, 600, s1), s1, normal, {
+      pointBudget: 50_000_000,
+    });
+    const err = denseFromLevel(autzen, (l) => autzen.geometricErrorAt(l));
+    for (let i = 0; i < err.length; i++) err[i] = err[i]! * 0.5;
+    run(
+      view(autzen, { nodeGeometricError: err }),
+      cameraLooking(autzen, 600, s2),
+      s2,
+      halved,
+      { pointBudget: 50_000_000 },
+    );
+
+    expect(halved.count).toBeLessThan(normal.count);
+  });
+});
+
+describe("the four jobs of spacingAt are separated (A2)", () => {
+  it("refines on geometric error and reports near-plane pitch independently", () => {
+    // Scale the two apart by a factor no octree would ever produce. If the
+    // split were cosmetic, one of these two assertions could not hold.
+    const s = createLodScratch();
+    const out = createLodSelection();
+    const PITCH = 7;
+    const split = view(autzen, {
+      pointSpacingAt: (l) => autzen.pointSpacingAt(l) * PITCH,
+    });
+    run(split, cameraLooking(autzen, 600, s), s, out, { pointBudget: 50_000_000 });
+
+    const s2 = createLodScratch();
+    const baseline = createLodSelection();
+    run(autzen, cameraLooking(autzen, 600, s2), s2, baseline, {
+      pointBudget: 50_000_000,
+    });
+
+    // Refinement is untouched: it reads the ERROR, which did not move.
+    expect(out.count).toBe(baseline.count);
+    // The near-plane quantity followed the PITCH, which did.
+    expect(out.minPointSpacingWorld).toBeCloseTo(
+      baseline.minPointSpacingWorld * PITCH,
+      12,
+    );
+  });
+
+  it("keeps minPointSpacingWorld off the refinement path entirely", () => {
+    const s = createLodScratch();
+    const out = createLodSelection();
+    // An absurd error with a sane pitch: selection collapses to the root alone,
+    // but the reported pitch is still the root's real pitch, not the error.
+    const collapsed = view(autzen, { geometricErrorAt: () => 1e-9 });
+    run(collapsed, cameraLooking(autzen, 600, s), s, out, {
+      pointBudget: 50_000_000,
+    });
+    expect(out.count).toBe(1);
+    expect(out.minPointSpacingWorld).toBeCloseTo(autzen.pointSpacingAt(0), 12);
+  });
+});
+
+describe("targetScreenError resolution (A4)", () => {
+  it("prefers the explicit option, then the format default, then 1.35", () => {
+    expect(resolveLodOptions({}).targetScreenError).toBe(DEFAULT_SCREEN_ERROR);
+    expect(resolveLodOptions({}, 16).targetScreenError).toBe(16);
+    expect(resolveLodOptions({ targetScreenError: 2 }, 16).targetScreenError).toBe(2);
+  });
+
+  it("accepts the deprecated targetPixelSpacing alias", () => {
+    expect(resolveLodOptions({ targetPixelSpacing: 3 }).targetScreenError).toBe(3);
+    // An explicit new-name value wins over the alias.
+    expect(
+      resolveLodOptions({ targetScreenError: 2, targetPixelSpacing: 9 })
+        .targetScreenError,
+    ).toBe(2);
+    // The alias still beats a format default: it is a caller instruction.
+    expect(resolveLodOptions({ targetPixelSpacing: 3 }, 16).targetScreenError).toBe(3);
+  });
+});
+
+describe("kernel eligibility (A1)", () => {
+  /**
+   * A kernel that survives NO child, so a selection that reached it collapses to
+   * the root alone. That makes "was the kernel consulted" observable from the
+   * selection itself, not only from the call counter.
+   */
+  function countingKernel(): LodKernels & {
+    calls: number;
+    firstChild: Float64Array | undefined;
+    firstPerChild: number | undefined;
+  } {
+    return {
+      planes: new Float64Array(24),
+      boxes: new Float64Array(48),
+      results: new Float64Array(16),
+      params: new Float64Array(11),
+      child: new Float64Array(16),
+      calls: 0,
+      firstChild: undefined,
+      firstPerChild: undefined,
+      selectChildren(_mask: number, _parentInside: boolean): number {
+        // Snapshot the FIRST call — the root's children — before the next
+        // admitted node overwrites the shared block.
+        if (this.calls === 0) {
+          this.firstChild = this.child.slice();
+          this.firstPerChild = this.params[10];
+        }
+        this.calls++;
+        return 0;
+      },
+    };
+  }
+
+  it("uses the kernel on a closed-form tree", () => {
+    const s = createLodScratch();
+    const out = createLodSelection();
+    const k = countingKernel();
+    run(autzen, cameraLooking(autzen, 600, s), s, out, { pointBudget: 50_000_000 }, k);
+
+    expect(k.calls).toBeGreaterThan(0);
+    // No child survived, so the root is the whole selection. If this were the
+    // TypeScript path the count would be in the hundreds.
+    expect(out.count).toBe(1);
+  });
+
+  it("marshals per-node overrides into the kernel's child block (A3)", () => {
+    // Since A3 the kernel CAN express eight errors and eight radii, so a tree
+    // with overrides is no longer pushed off the fast path. What must hold is
+    // that each slot carries ITS OWN child's value — feeding slot c the value
+    // of a different node is the silent-wrong-picture failure this guards.
+    const s = createLodScratch();
+    const out = createLodSelection();
+    const k = countingKernel();
+    // A distinctive per-node pattern, so a broadcast or an off-by-one slot is
+    // visible rather than plausible.
+    const err = new Float64Array(autzen.nodeCount);
+    const rad = new Float64Array(autzen.nodeCount);
+    for (let i = 0; i < autzen.nodeCount; i++) {
+      err[i] = 1000 + i;
+      rad[i] = 2_000_000 + i;
+    }
+    const overridden = view(autzen, {
+      nodeGeometricError: err,
+      nodeBoundingRadius: rad,
+    });
+    run(overridden, cameraLooking(autzen, 600, s), s, out, { pointBudget: 50_000_000 }, k);
+
+    expect(k.calls).toBeGreaterThan(0);
+    expect(k.firstPerChild).toBe(1);
+    for (let c = 0; c < 8; c++) {
+      const kid = autzen.root.children[c];
+      if (kid === undefined) continue;
+      expect(k.firstChild![c]).toBe(err[kid.index]);
+      expect(k.firstChild![8 + c]).toBe(rad[kid.index]);
+    }
+  });
+
+  it("leaves the per-child flag clear on a closed-form tree", () => {
+    // The cost argument: an octree must keep writing two scalars per admitted
+    // node, not sixteen. If this flag ever came up on autzen, every octree would
+    // silently start paying for a generality it does not use.
+    const s = createLodScratch();
+    const out = createLodSelection();
+    const k = countingKernel();
+    run(autzen, cameraLooking(autzen, 600, s), s, out, { pointBudget: 50_000_000 }, k);
+    expect(k.firstPerChild).toBe(0);
+  });
+
+  it("keeps the closed-form path when only the POINT PITCH is overridden", () => {
+    // `nodePointSpacing` never reaches the kernel — it feeds the near plane, not
+    // the child math — so it must not switch the kernel to the per-child block.
+    const s = createLodScratch();
+    const out = createLodSelection();
+    const k = countingKernel();
+    const overridden = view(autzen, {
+      nodePointSpacing: denseFromLevel(autzen, (l) => autzen.pointSpacingAt(l)),
+    });
+    run(overridden, cameraLooking(autzen, 600, s), s, out, { pointBudget: 50_000_000 }, k);
+
+    expect(k.calls).toBeGreaterThan(0);
+    expect(k.firstPerChild).toBe(0);
   });
 });

@@ -1,4 +1,4 @@
-import type { DecodedPointData } from "@voxelkloud/loader";
+import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Group, Material } from "three/webgpu";
 import { PointArena } from "./arena.js";
 import type { ArenaBlock, ArenaOptions } from "./arena.js";
@@ -35,8 +35,8 @@ export class ArenaSink implements PointSink {
   constructor(
     parent: Group,
     material: Material,
-    spacingAt: (level: number) => number,
-    radiusAt: (level: number) => number,
+    pointSpacingAt: (level: number) => number,
+    boundingRadiusAt: (level: number) => number,
     private readonly needsAlphaStamp: boolean,
     options: ArenaOptions = {},
     /**
@@ -49,8 +49,8 @@ export class ArenaSink implements PointSink {
     this.arena = new PointArena(
       parent,
       material,
-      spacingAt,
-      radiusAt,
+      pointSpacingAt,
+      boundingRadiusAt,
       options,
       scalarAttribute !== undefined,
     );

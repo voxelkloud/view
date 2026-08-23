@@ -1,16 +1,18 @@
+// THE SEAM IS CLOSED. This file used to import the Potree driver outright,
+// because the node payload was the one step no neutral contract covered.
+// `PointReader` is that contract: a renderer walks a neutral tree and asks a
+// reader for a node's vertices, and Potree, COPC and EPT answer the same way.
+// Nothing here names a format any more.
+import { VoxelkloudError, isVoxelkloudError } from "@voxelkloud/core";
 import type {
   DecodedPointData,
-  PointCloudHierarchy,
-  PointCloudSource,
-  PointRecordLayout,
-} from "@voxelkloud/loader";
-import {
-  VoxelkloudError,
-  createPointLayout,
-  isVoxelkloudError,
-  loadPointData,
-} from "@voxelkloud/loader";
-import type { BrotliDecompress } from "@voxelkloud/loader";
+  NodeDecompress,
+  PointCloudNode,
+  PointCloudSourceBase,
+  PointCloudTreeBase,
+  PointReader,
+  PointReaderFactory,
+} from "@voxelkloud/core";
 import {
   Matrix4,
   PerspectiveCamera,
@@ -66,9 +68,9 @@ import type { PointSink } from "./sink.js";
  * colour — which is why it survived until a 3DEP survey turned up.
  */
 export function cloudRelativeElevationRange(
-  source: PointCloudSource,
+  source: PointCloudSourceBase,
 ): [number, number] {
-  const originZ = source.metadata.boundingBox.min[2];
+  const originZ = source.bounds.min[2];
   const tight = source.tightBoundingBox;
   return [tight.min[2] - originZ, tight.max[2] - originZ];
 }
@@ -83,18 +85,18 @@ export function cloudRelativeElevationRange(
  * intensity that is `t = 0.7 / 65535`, i.e. the whole cloud at the ramp's first
  * stop, which is the exact shape of the elevation bug above.
  *
- * The transform is read off the LAYOUT rather than recomputed, so this cannot
+ * The transform is read off the READER rather than recomputed, so this cannot
  * drift from what the decoder did.
  */
 export function scalarRangeFor(
-  source: PointCloudSource,
-  layout: PointRecordLayout,
+  source: PointCloudSourceBase,
+  reader: PointReader,
   name: string,
 ): [number, number] {
   const attribute = source.attributesByName.get(name);
   const lo = attribute?.min[0] ?? 0;
   const hi = attribute?.max[0] ?? 1;
-  const pack = layout.fields.find((f) => f.name === name)?.pack;
+  const pack = reader.packingFor(name);
   const apply = (v: number) =>
     pack === undefined ? v : (v - pack.offset) * pack.scale;
   const a = apply(lo);
@@ -153,14 +155,17 @@ export interface PointCloudViewOptions {
    */
   readonly maxAttachBytesPerFrame?: number;
   /**
-   * A brotli decompressor, for BROTLI-encoded clouds in an environment without
-   * a native one — which is every current browser.
+   * A whole-payload decompressor, for a driver that needs one supplied from
+   * outside: a BROTLI Potree cloud or a zstandard EPT one, neither of which any
+   * current browser can decode on its own.
    *
    * ```ts
    * const { brotliDecompress } = await import("@voxelkloud/loader/brotli");
    * ```
+   *
+   * Passed straight through to the reader factory `addCloud` was given.
    */
-  readonly decompress?: BrotliDecompress;
+  readonly decompress?: NodeDecompress;
   /**
    * How point data reaches the GPU.
    *
@@ -190,12 +195,12 @@ export interface ViewProfileOptions extends ProfileExtractionOptions {
 }
 
 interface CloudHandle {
-  readonly source: PointCloudSource;
-  readonly hierarchy: PointCloudHierarchy;
+  readonly source: PointCloudSourceBase;
+  readonly hierarchy: PointCloudTreeBase;
   readonly object: PointCloudObject3D;
   readonly material: PointCloudMaterial;
   readonly sink: PointSink & { residentBytes: number; nodeCount: number };
-  readonly layout: PointRecordLayout;
+  readonly reader: PointReader;
   readonly scratch: LodScratch;
   readonly selection: LodSelection;
   readonly cam: LodCameraState;
@@ -256,6 +261,14 @@ export class PointCloudView {
   };
 
   private readonly clouds: CloudHandle[] = [];
+  /**
+   * Whether the CALLER named a target. Only when they did not may a cloud's
+   * format-native `defaultScreenError` take over — an explicit 1.35 must not be
+   * silently replaced by a driver's 16.
+   */
+  private readonly targetNamed: boolean;
+  /** Set once, by the first cloud that carries a format default. */
+  private targetAdopted = false;
   private readonly lodOptions: { -readonly [K in keyof ResolvedLodOptions]: ResolvedLodOptions[K] };
   private readonly materialOptions;
   private readonly maxConcurrent: number;
@@ -285,6 +298,9 @@ export class PointCloudView {
     // THE SHADER, and cloud-relative positions come out WORSE than absolute
     // ones — a measured 34.1 px of jitter against 29.2 px. With it, 0.46 px.
     this.renderer.highPrecision = true;
+    this.targetNamed =
+      options.lod?.targetScreenError !== undefined ||
+      options.lod?.targetPixelSpacing !== undefined;
     this.lodOptions = resolveLodOptions(options.lod);
     this.materialOptions = options.material ?? {};
     this.maxConcurrent = options.maxConcurrentLoads ?? 12;
@@ -314,12 +330,20 @@ export class PointCloudView {
     this.dirty = true;
   }
 
-  /** Add a cloud. `hierarchy` must already have its root expanded. */
+  /**
+   * Add a cloud. `hierarchy` must already have its root expanded.
+   *
+   * `openPoints` is the driver's reader factory — `loadPointCloud` returns one
+   * bound to the source, or take it from `format.openPoints`. It is a FACTORY
+   * rather than a ready reader because the attribute selection depends on this
+   * view's colour mode, which the caller does not know.
+   */
   addCloud(
-    source: PointCloudSource,
-    hierarchy: PointCloudHierarchy,
+    source: PointCloudSourceBase,
+    hierarchy: PointCloudTreeBase,
+    openPoints: PointReaderFactory,
   ): PointCloudObject3D {
-    const origin = source.metadata.boundingBox.min;
+    const origin = source.bounds.min;
     const sceneOrigin =
       this.clouds.length === 0 ? origin : this.clouds[0]!.object.getSceneOrigin();
     const object = new PointCloudObject3D(origin, sceneOrigin);
@@ -348,8 +372,11 @@ export class PointCloudView {
     // Naming the scalar deselects colour, which is right: none of the modes
     // that read a scalar also read RGB, and not fetching it halves the bytes
     // per point on a cloud that has both.
-    const layout = createPointLayout(source, {
+    const reader = openPoints({
       computeBounds: true,
+      ...(this.options.decompress !== undefined
+        ? { decompress: this.options.decompress }
+        : {}),
       ...(scalarAttribute !== undefined
         ? {
             attributes: [scalarAttribute],
@@ -368,7 +395,7 @@ export class PointCloudView {
       // survived until a 3DEP survey turned up.
       elevationRange: cloudRelativeElevationRange(source),
       ...(scalarAttribute !== undefined
-        ? { scalarRange: scalarRangeFor(source, layout, scalarAttribute) }
+        ? { scalarRange: scalarRangeFor(source, reader, scalarAttribute) }
         : {}),
       ...this.materialOptions,
     });
@@ -383,12 +410,25 @@ export class PointCloudView {
         : new ArenaSink(
             object,
             material,
-            (l) => hierarchy.spacingAt(l),
-            (l) => hierarchy.radiusAt(l),
+            (l) => hierarchy.pointSpacingAt(l),
+            (l) => hierarchy.boundingRadiusAt(l),
             needsAlphaStamp,
             {},
             scalarAttribute,
           );
+
+    // A tile format's error is not a point pitch, so its calibrated threshold is
+    // not 1.35 px. Adopt it only when the caller named none, and only once: two
+    // clouds with different defaults would otherwise fight over a knob that is
+    // global to the view.
+    if (
+      !this.targetNamed &&
+      !this.targetAdopted &&
+      hierarchy.defaultScreenError !== undefined
+    ) {
+      this.lodOptions.targetScreenError = hierarchy.defaultScreenError;
+      this.targetAdopted = true;
+    }
 
     this.scene.add(object);
     this.clouds.push({
@@ -397,7 +437,7 @@ export class PointCloudView {
       object,
       material,
       sink,
-      layout,
+      reader,
       scratch: createLodScratch(),
       selection: createLodSelection(this.lodOptions.maxNodes),
       cam: {
@@ -419,7 +459,7 @@ export class PointCloudView {
       failed: new Set(),
       pending: [],
       queued: new Set(),
-      prevMinSpacing: source.metadata.spacing,
+      prevMinSpacing: hierarchy.pointSpacingAt(0),
     });
     this.dirty = true;
     return object;
@@ -502,7 +542,7 @@ export class PointCloudView {
     query: ProfileQuery,
     options: ViewProfileOptions = {},
   ): AsyncGenerator<ProfileBatch> {
-    const { cloudIndex = 0, decompress, ...profileOptions } = options;
+    const { cloudIndex = 0, ...profileOptions } = options;
     const h = this.clouds[cloudIndex];
     if (h === undefined) {
       throw new RangeError(`No point cloud exists at index ${cloudIndex}.`);
@@ -511,17 +551,14 @@ export class PointCloudView {
       {
         source: h.source,
         hierarchy: h.hierarchy,
+        // The view's own reader, which already has this cloud's decompressor
+        // and attribute selection. A profile that wants a different selection
+        // passes `pointData` and gets its own.
+        openPoints: () => h.reader,
         readPoints: (index: number) => h.sink.readPoints(index),
       },
       query,
-      {
-        ...profileOptions,
-        ...(decompress !== undefined
-          ? { decompress }
-          : this.options.decompress !== undefined
-            ? { decompress: this.options.decompress }
-            : {}),
-      },
+      profileOptions,
     );
   }
 
@@ -567,21 +604,28 @@ export class PointCloudView {
 
   /**
    * Change the LOD quality target at runtime — the primary control, in device
-   * pixels of inter-point spacing.
+   * pixels of projected geometric error. On a point octree that error IS the
+   * inter-point spacing; on a tile format it is not, which is why the parameter
+   * is no longer named for a spacing.
    *
    * Lower refines further. Worth turning down when `stats.limitedBy` reports
    * `"error"` while frame time is flat: that combination means the target was
    * met with budget and frame both to spare.
    */
-  setTargetPixelSpacing(px: number): void {
-    this.lodOptions.targetPixelSpacing = px;
+  setTargetScreenError(px: number): void {
+    this.lodOptions.targetScreenError = px;
     this.dirty = true;
+  }
+
+  /** @deprecated Renamed to {@link setTargetScreenError}. */
+  setTargetPixelSpacing(px: number): void {
+    this.setTargetScreenError(px);
   }
 
   /**
    * Points drawn per frame.
    *
-   * Raise this BEFORE lowering `targetPixelSpacing`: measured on autzen at a
+   * Raise this BEFORE lowering `targetScreenError`: measured on autzen at a
    * 0.25 framing, the 3M default binds at a target of 1.0 and below, so the
    * quality knob does nothing until the budget has room. `stats.limitedBy`
    * reports which of the two is actually holding.
@@ -634,7 +678,7 @@ export class PointCloudView {
       h.sink.setVisible(h.selection.indices, h.selection.count);
       h.sink.commit();
 
-      h.prevMinSpacing = h.selection.minSpacingWorld;
+      h.prevMinSpacing = h.selection.minPointSpacingWorld;
       visibleNodes += h.selection.count;
       visiblePoints += h.selection.points;
       residentNodes += h.sink.nodeCount;
@@ -718,7 +762,7 @@ export class PointCloudView {
     // NOT `this.camera.near`, which is where this used to come from and which
     // closed a feedback loop through the scheduler:
     //
-    //   selection -> minSpacingWorld (view.ts, end of renderFrame)
+    //   selection -> minPointSpacingWorld (view.ts, end of renderFrame)
     //             -> suggestNearFar -> camera.near
     //             -> cam.nearFloor
     //             -> the `d` clamp in select.ts, which sets the prune threshold
@@ -730,7 +774,7 @@ export class PointCloudView {
     // deeper still, shallower raised it to the 100 ceiling and collapsed. The
     // 2x gate on writing camera.near did not open the loop, it just turned
     // oscillation into a latch. MEASURED on autzen at a fixed camera, sweeping
-    // only targetPixelSpacing: 1.35 -> 1.10M points at level 5, 1.0 -> 4.17M at
+    // only targetScreenError: 1.35 -> 1.10M points at level 5, 1.0 -> 4.17M at
     // level 6, 0.7 -> 1.25M at level FOUR. A stricter target selecting less
     // detail is not a tuning problem, it is the loop latching.
     //
@@ -738,7 +782,7 @@ export class PointCloudView {
     // can feed back into it. It still moves as lazy expansion discovers deeper
     // chunks, but only ever downward, so it converges instead of oscillating —
     // and a caller that ran `expandAll()` has it constant from the first frame.
-    h.cam.nearFloor = h.hierarchy.spacingAt(h.hierarchy.maxLevel);
+    h.cam.nearFloor = h.hierarchy.pointSpacingAt(h.hierarchy.maxLevel);
     h.cam.depthRange = this.depthRange;
 
     extractFrustumPlanes(
@@ -768,22 +812,19 @@ export class PointCloudView {
       ) {
         continue;
       }
-      const node = h.hierarchy.node(i);
+      // Where the seam used to be. `hasPayload` is the driver's answer to
+      // "does this node have bytes at all", which is a real question with three
+      // different answers: 47 of autzen's nodes carry no payload of their own,
+      // a COPC placeholder has none until its hierarchy page lands, and an EPT
+      // node always does. Asking beats discovering it in a catch.
+      const node: PointCloudNode | undefined = h.hierarchy.node(i);
       if (node === undefined || node.numPoints === 0) continue;
-      if (node.byteSize === undefined) continue;
+      if (!h.reader.hasPayload(node)) continue;
 
       const controller = new AbortController();
       h.inFlight.set(i, controller);
-      void loadPointData(
-        h.source,
-        node,
-        {
-          signal: controller.signal,
-          computeBounds: true,
-          decompress: this.options.decompress,
-        },
-        h.layout,
-      )
+      void h.reader
+        .read(node, { signal: controller.signal, computeBounds: true })
         .then((data) => {
           h.inFlight.delete(i);
           if (this.disposed) return;
@@ -837,7 +878,7 @@ export class PointCloudView {
       const bytes = h.sink.attach(
         p.index,
         p.data,
-        h.hierarchy.spacingAt(p.level),
+        h.hierarchy.pointSpacingAt(p.level),
         p.level,
       );
       if (bytes > 0) {

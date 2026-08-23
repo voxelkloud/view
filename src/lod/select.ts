@@ -1,4 +1,7 @@
-import type { HierarchyNode } from "@voxelkloud/loader";
+// The NEUTRAL node, not a driver's. `lod/` still declares its TREE surface
+// structurally — that is what keeps this module graph free of runtime imports —
+// but the node type is shared vocabulary and worth naming once.
+import type { PointCloudNode as HierarchyNode } from "@voxelkloud/core";
 import { Containment, classifyAabb } from "./frustum.js";
 import type { DepthRange } from "./frustum.js";
 import { heapPop, heapPush } from "./heap.js";
@@ -16,10 +19,36 @@ export interface LodTreeView {
   readonly nodeCount: number;
   readonly root: HierarchyNode;
   node(index: number): HierarchyNode | undefined;
-  /** Per-level constant: `radiusAt(L) === radiusAt(0) / 2 ** L`, exactly. */
-  radiusAt(level: number): number;
-  /** `metadata.spacing / 2 ** level`. */
-  spacingAt(level: number): number;
+  /**
+   * THE REFINEMENT QUANTITY, world units. Multiplied by the projection factor
+   * and compared against `targetScreenError`; the product is also the heap key.
+   * For an octree this equals `pointSpacingAt`; for a tile format it is the
+   * tile's geometric error.
+   */
+  geometricErrorAt(level: number): number;
+  /**
+   * THE POINT PITCH, world units. Drives `minPointSpacingWorld`, and through it
+   * the near plane. NEVER the refinement key — see `nodeGeometricError`.
+   */
+  pointSpacingAt(level: number): number;
+  /** Per-level constant: `boundingRadiusAt(L) === boundingRadiusAt(0) / 2 ** L`. */
+  boundingRadiusAt(level: number): number;
+  /**
+   * Dense per-node overrides indexed by `node.index`, for formats whose LOD
+   * quantities are not a closed form of the level. `undefined` on every octree
+   * format, which is the common case and costs nothing: they are hoisted once
+   * per frame, so the branch is constant for the whole traversal.
+   *
+   * A driver that fills `nodeGeometricError` owes MONOTONICITY
+   * (`error[child] <= error[parent]`), clamped at expansion time. The
+   * scheduler's best-first ordering is only correct because the key cannot rise
+   * as it descends, and it does not re-check.
+   */
+  readonly nodeGeometricError?: Float64Array | undefined;
+  readonly nodePointSpacing?: Float64Array | undefined;
+  readonly nodeBoundingRadius?: Float64Array | undefined;
+  /** Format-native default for `targetScreenError`, device px. */
+  readonly defaultScreenError?: number | undefined;
   /** SYNCHRONOUS, never throws, safe from a render loop. */
   tryExpandSync(node: HierarchyNode): boolean;
   /** Fire-and-forget. A documented no-op inside a backoff window. */
@@ -64,10 +93,19 @@ export interface LodCameraState {
 
 export interface LodOptions {
   /**
-   * THE PRIMARY CONTROL. Target inter-point spacing on screen, in DEVICE pixels.
-   * Refinement into a child stops when its projected point spacing would fall
-   * below this. Default 1.35.
+   * THE PRIMARY CONTROL. Target screen-space error, in DEVICE pixels.
+   * Refinement into a child stops when its projected geometric error would fall
+   * below this.
+   *
+   * Named "error" rather than "spacing" because the quantity is only a point
+   * spacing on point octrees — where it is exactly that, and 1.35 px is the
+   * calibrated default. On a tile format the same product is a projected tile
+   * error and wants a different number, which is what `defaultScreenError` on
+   * the tree carries. Resolution order: this option, then the tree's default,
+   * then {@link DEFAULT_SCREEN_ERROR}.
    */
+  readonly targetScreenError?: number;
+  /** @deprecated Renamed to {@link targetScreenError}. */
   readonly targetPixelSpacing?: number;
   /**
    * Points DRAWN per frame. Default 3,000,000 (48 MB of GPU vertex data at
@@ -92,7 +130,17 @@ export interface LodOptions {
   readonly maxBudgetSkips?: number;
 }
 
-export type ResolvedLodOptions = Required<LodOptions>;
+/** Resolved options. The deprecated alias is collapsed away, never carried. */
+export interface ResolvedLodOptions {
+  readonly targetScreenError: number;
+  readonly pointBudget: number;
+  readonly maxNodes: number;
+  readonly maxLevel: number;
+  readonly maxBudgetSkips: number;
+}
+
+/** The point-octree calibration. See `metric.ts` for where 1.35 px comes from. */
+export const DEFAULT_SCREEN_ERROR = 1.35;
 
 /**
  * The optional wasm kernel surface.
@@ -107,13 +155,21 @@ export interface LodKernels {
   readonly planes: Float64Array;
   readonly boxes: Float64Array;
   readonly results: Float64Array;
+  /** 11 f64. Index 10 is the per-child flag, written once per frame. */
   readonly params: Float64Array;
+  /** 16 f64: `[geometricError; 8]` then `[boundingRadius; 8]`. */
+  readonly child: Float64Array;
   selectChildren(mask: number, parentInside: boolean): number;
 }
 
-export function resolveLodOptions(o: LodOptions = {}): ResolvedLodOptions {
+export function resolveLodOptions(
+  o: LodOptions = {},
+  /** The tree's `defaultScreenError`, when the caller named no target. */
+  formatDefault: number = DEFAULT_SCREEN_ERROR,
+): ResolvedLodOptions {
   return {
-    targetPixelSpacing: o.targetPixelSpacing ?? 1.35,
+    targetScreenError:
+      o.targetScreenError ?? o.targetPixelSpacing ?? formatDefault,
     pointBudget: o.pointBudget ?? 3_000_000,
     maxNodes: o.maxNodes ?? 4096,
     maxLevel: o.maxLevel ?? Number.POSITIVE_INFINITY,
@@ -177,8 +233,12 @@ export interface LodSelection {
    * 150 px and 50 px give byte-identical autzen selections at 1500/300/80 m.
    */
   limitedBy: "complete" | "error" | "budget" | "nodes";
-  /** Min `spacingAt(level)` over ADMITTED nodes only. Drives near/far. */
-  minSpacingWorld: number;
+  /**
+   * Min POINT PITCH over ADMITTED nodes only — never the geometric error.
+   * Drives near/far, whose rule is calibrated against the 24-bit depth quantum
+   * in units of point pitch.
+   */
+  minPointSpacingWorld: number;
   maxSelectedLevel: number;
   /** Admitted count per level. Free, and what makes an LOD bug legible. */
   readonly levelCounts: Int32Array;
@@ -194,7 +254,7 @@ export function createLodSelection(maxNodes = 4096): LodSelection {
     points: 0,
     frame: 0,
     limitedBy: "complete",
-    minSpacingWorld: 0,
+    minPointSpacingWorld: 0,
     maxSelectedLevel: 0,
     levelCounts: new Int32Array(MAX_LEVELS),
     needsExpand: new Int32Array(maxNodes),
@@ -242,6 +302,18 @@ export function selectVisible(
   kernels?: LodKernels,
 ): LodSelection {
   ensureLodCapacity(s, out, tree.nodeCount, opts.maxNodes);
+  // HOISTED ONCE PER FRAME. These are constant for the whole traversal, so the
+  // branch on each is perfectly predicted and the closed-form formats — every
+  // octree, which is the common case — pay nothing for the generality.
+  const errArr = tree.nodeGeometricError;
+  const spcArr = tree.nodePointSpacing;
+  const radArr = tree.nodeBoundingRadius;
+  // Whether the child loop must feed the kernel eight errors and eight radii
+  // rather than one of each. Constant for the frame, so the kernel is told once
+  // and the closed-form formats — every octree — keep writing exactly the two
+  // scalars they wrote before this generality existed.
+  const perChild = errArr !== undefined || radArr !== undefined;
+  const useKernel = kernels !== undefined;
   const frame = ++s.frame;
   let heap = 0;
   let n = 0;
@@ -259,7 +331,7 @@ export function selectVisible(
     out.frame = frame;
     out.limitedBy = "complete";
     out.needsExpandCount = 0;
-    out.minSpacingWorld = tree.spacingAt(0);
+    out.minPointSpacingWorld = spcArr?.[tree.root.index] ?? tree.pointSpacingAt(0);
     out.maxSelectedLevel = 0;
     return out;
   }
@@ -267,8 +339,8 @@ export function selectVisible(
   // Everything except the per-level radius and spacing is constant for the
   // whole frame, so it is written into the kernel block ONCE rather than on
   // every admitted node.
-  if (kernels !== undefined) {
-    const p = kernels.params;
+  if (useKernel) {
+    const p = kernels!.params;
     p[0] = cam.camX;
     p[1] = cam.camY;
     p[2] = cam.camZ;
@@ -277,6 +349,7 @@ export function selectVisible(
     p[7] = cam.viewportHeightPx;
     p[8] = cam.orthoProjFactor;
     p[9] = cam.orthographic ? 1 : 0;
+    p[10] = perChild ? 1 : 0;
   }
 
   const rootIndex = tree.root.index;
@@ -308,7 +381,8 @@ export function selectVisible(
     const lvl = node.level;
     out.levelCounts[lvl] = (out.levelCounts[lvl] ?? 0) + 1;
     if (lvl > deepest) deepest = lvl;
-    const sp = tree.spacingAt(lvl);
+    // POINT PITCH, not the refinement key: this feeds the near plane.
+    const sp = spcArr !== undefined ? spcArr[i]! : tree.pointSpacingAt(lvl);
     if (sp < minSpacing) minSpacing = sp;
 
     if (node.childMask === 0) continue; // 80.5% of autzen nodes
@@ -326,14 +400,16 @@ export function selectVisible(
     }
     if (lvl + 1 > opts.maxLevel) continue;
 
-    const rChild = tree.radiusAt(lvl + 1);
-    const spChild = tree.spacingAt(lvl + 1);
+    // The closed-form values for the child level. When a per-node array is
+    // present these are the fallback; when it is not, they ARE the value.
+    const rChildLevel = tree.boundingRadiusAt(lvl + 1);
+    const eChildLevel = tree.geometricErrorAt(lvl + 1);
 
-    if (kernels !== undefined) {
+    if (useKernel) {
       // ONE boundary crossing per admitted node, not per child: the arithmetic
       // per child is comparable to the cost of a crossing, so per-child calls
       // would be a wash.
-      const { boxes, results, params } = kernels;
+      const { boxes, results, params, child: childBlock } = kernels!;
       let mask = 0;
       for (let c = 0; c < 8; c++) {
         const child = node.children[c];
@@ -345,12 +421,20 @@ export function selectVisible(
         boxes[o + 3] = child.maxX;
         boxes[o + 4] = child.maxY;
         boxes[o + 5] = child.maxZ;
+        // Filled in the SAME pass that fills the boxes, so the per-child path
+        // costs writes and not a second walk of the child slots.
+        if (perChild) {
+          childBlock[c] =
+            errArr !== undefined ? errArr[child.index]! : eChildLevel;
+          childBlock[8 + c] =
+            radArr !== undefined ? radArr[child.index]! : rChildLevel;
+        }
         mask |= 1 << c;
       }
-      params[3] = rChild;
-      params[4] = spChild;
+      params[3] = rChildLevel;
+      params[4] = eChildLevel;
 
-      const survived = kernels.selectChildren(
+      const survived = kernels!.selectChildren(
         mask,
         containment === Containment.Inside,
       );
@@ -358,7 +442,7 @@ export function selectVisible(
         if (((survived >> c) & 1) === 0) continue;
         const child = node.children[c]!;
         const key = results[c * 2 + 1]!;
-        if (key < opts.targetPixelSpacing) {
+        if (key < opts.targetScreenError) {
           if (limitedBy === "complete") limitedBy = "error";
           continue;
         }
@@ -390,6 +474,9 @@ export function selectVisible(
             );
       if (cc === Containment.Outside) continue;
 
+      const rChild = radArr !== undefined ? radArr[child.index]! : rChildLevel;
+      const eChild = errArr !== undefined ? errArr[child.index]! : eChildLevel;
+
       const dx = cam.camX - (child.minX + child.maxX) * 0.5;
       const dy = cam.camY - (child.minY + child.maxY) * 0.5;
       const dz = cam.camZ - (child.minZ + child.maxZ) * 0.5;
@@ -402,8 +489,8 @@ export function selectVisible(
         ? cam.orthoProjFactor
         : (0.5 * cam.viewportHeightPx) / (cam.slope * d);
 
-      const key = spChild * pf; // projected point spacing, device px
-      if (key < opts.targetPixelSpacing) {
+      const key = eChild * pf; // projected geometric error, device px
+      if (key < opts.targetScreenError) {
         if (limitedBy === "complete") limitedBy = "error";
         continue;
       }
@@ -418,7 +505,8 @@ export function selectVisible(
   out.limitedBy = limitedBy;
   out.needsExpandCount = ne;
   out.maxSelectedLevel = deepest;
-  out.minSpacingWorld = minSpacing === Infinity ? tree.spacingAt(0) : minSpacing;
+  out.minPointSpacingWorld =
+    minSpacing === Infinity ? tree.pointSpacingAt(0) : minSpacing;
   return out;
 }
 

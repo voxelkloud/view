@@ -1,7 +1,7 @@
 # @voxelkloud/view
 
 WebGPU point cloud renderer on three.js, consuming
-[@voxelkloud/loader](https://github.com/voxelkloud/loader) streams.
+[@voxelkloud/loader](../loader/README.md) streams.
 
 ```sh
 npm install @voxelkloud/view @voxelkloud/loader three
@@ -53,6 +53,6 @@ The scheduler on its own — frustum extraction, AABB classification, the
 screen-space-error metric, best-first selection — behind a subpath whose module
 graph pulls in no three, no DOM and no GPU. Allocation-free in steady state.
 
-Full documentation: [voxelkloud](https://github.com/voxelkloud/voxelkloud).
+Full documentation: [voxelkloud](../../README.md).
 
 MIT.

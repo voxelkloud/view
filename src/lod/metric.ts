@@ -28,7 +28,11 @@ export function projectionFactorOrthographic(
 }
 
 /**
- * Projected inter-point spacing, in device pixels — THE control quantity.
+ * Projected geometric error, in device pixels — THE control quantity.
+ *
+ * On a point octree the geometric error IS the inter-point spacing, which is
+ * what the calibration below is about. On a tile format the same product is a
+ * projected tile error; same units, different meaning, different threshold.
  *
  * Proportional to the reference's `screenPixelRadius` by the per-cloud constant
  * `k = metadata.spacing / rootHalfDiagonal`, so it induces an identical heap
@@ -39,19 +43,22 @@ export function projectionFactorOrthographic(
  * real data and 21.65 px on the synthetic fixture — a 16x swing in effective LOD
  * from an unchanged knob.
  */
-export function screenSpacingPx(
-  spacingAtLevel: number,
+export function screenErrorPx(
+  geometricErrorAtLevel: number,
   projFactor: number,
 ): number {
-  return spacingAtLevel * projFactor;
+  return geometricErrorAtLevel * projFactor;
 }
+
+/** @deprecated Renamed to {@link screenErrorPx}. */
+export const screenSpacingPx = screenErrorPx;
 
 /** Projected bounding-sphere radius in device pixels. Diagnostics and HUD. */
 export function screenPixelRadius(
-  radiusAtLevel: number,
+  boundingRadiusAtLevel: number,
   projFactor: number,
 ): number {
-  return radiusAtLevel * projFactor;
+  return boundingRadiusAtLevel * projFactor;
 }
 
 export interface NearFarOptions {
@@ -69,7 +76,11 @@ export interface NearFar {
 }
 
 /**
- * Derive near/far from the deepest ADMITTED spacing and the view depth.
+ * Derive near/far from the deepest ADMITTED POINT PITCH and the view depth.
+ *
+ * The argument is a point pitch and never a geometric error. The whole rule is
+ * a comparison against the 24-bit depth quantum in units of point pitch, so a
+ * tile error handed to it would silently misplace the near plane.
  *
  * With a fixed near of 0.1 the 24-bit depth quantum exceeds the LOD-implied
  * point pitch beyond roughly 1 km, so it fails across the far half of autzen
@@ -85,7 +96,7 @@ export interface NearFar {
  * frame instead, so the culling frustum and the render frustum always match.
  */
 export function suggestNearFar(
-  minSpacingWorld: number,
+  minPointSpacingWorld: number,
   viewDepth: number,
   options: NearFarOptions = {},
 ): NearFar {
@@ -96,7 +107,7 @@ export function suggestNearFar(
   const minSpan = options.minFarSpan ?? 10_000;
 
   const near = Math.min(
-    Math.max(minSpacingWorld * multiple, minNear),
+    Math.max(minPointSpacingWorld * multiple, minNear),
     maxNear,
   );
   const far = Math.max(headroom * viewDepth, near + minSpan);
