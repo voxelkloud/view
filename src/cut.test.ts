@@ -15,7 +15,7 @@ import {
 import type { LodCameraState, LodScratch } from "./lod/select.js";
 
 const LOADER_FIXTURES = new URL(
-  "../../format-potree/src/__fixtures__/",
+  "./__fixtures__/",
   import.meta.url,
 );
 const FAKE_URLS = {

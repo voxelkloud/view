@@ -21,7 +21,7 @@ function autzen(): PointCloudSource {
     JSON.parse(
       readFileSync(
         new URL(
-          "../../format-potree/src/__fixtures__/autzen.metadata.json",
+          "./__fixtures__/autzen.metadata.json",
           import.meta.url,
         ).pathname,
         "utf8",

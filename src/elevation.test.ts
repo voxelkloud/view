@@ -21,7 +21,7 @@ describe("cloudRelativeElevationRange", () => {
   it("rebases the tight Z extent onto the cloud origin", () => {
     const source = sourceFrom(
       new URL(
-        "../../format-potree/src/__fixtures__/autzen.metadata.json",
+        "./__fixtures__/autzen.metadata.json",
         import.meta.url,
       ).pathname,
     );
@@ -42,7 +42,7 @@ describe("cloudRelativeElevationRange", () => {
   it("spans the ramp instead of collapsing it", () => {
     const source = sourceFrom(
       new URL(
-        "../../format-potree/src/__fixtures__/autzen.metadata.json",
+        "./__fixtures__/autzen.metadata.json",
         import.meta.url,
       ).pathname,
     );

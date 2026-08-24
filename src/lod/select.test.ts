@@ -23,7 +23,7 @@ import type {
 // suite; reading them here keeps the scheduler tested against real converter
 // output rather than a synthetic tree that cannot reproduce its shape.
 const LOADER_FIXTURES = new URL(
-  "../../../format-potree/src/__fixtures__/",
+  "../__fixtures__/",
   import.meta.url,
 );
 
