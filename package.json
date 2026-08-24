@@ -1,6 +1,6 @@
 {
   "name": "@voxelkloud/view",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "WebGPU point cloud renderer built on three.js (WebGPURenderer/TSL), consuming @voxelkloud/loader streams.",
   "license": "MIT",
   "keywords": [
