@@ -903,6 +903,12 @@ function positiveLimit(value: number, name: string): number {
 
 function depthLimit(value: number | undefined): number {
   if (value === undefined) return Number.POSITIVE_INFINITY;
+  // Infinity IS the unlimited value, as it is for `positiveLimit`. Without this
+  // the call site's `?? Number.POSITIVE_INFINITY` — the same pattern its two
+  // siblings use — turned "omit it for unlimited" into a guaranteed throw, so
+  // the documented default could never be reached and an explicit
+  // `maxDepth: Infinity` failed too.
+  if (value === Number.POSITIVE_INFINITY) return value;
   if (!Number.isFinite(value) || value < 0) {
     throw new RangeError("maxDepth must be a non-negative number.");
   }

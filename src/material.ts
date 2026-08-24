@@ -1,22 +1,40 @@
-import { DoubleSide, NodeMaterial, SRGBColorSpace } from "three/webgpu";
 import {
+  DataTexture,
+  DoubleSide,
+  NearestFilter,
+  NodeMaterial,
+  RGBAFormat,
+  SRGBColorSpace,
+  UnsignedByteType,
+} from "three/webgpu";
+import {
+  Break,
   Discard,
   Fn,
   If,
+  Loop,
   attribute,
+  bitAnd,
   cameraProjectionMatrix,
   colorSpaceToWorking,
+  exp2,
   float,
   int,
+  ivec2,
   mix,
   modelViewMatrix,
   positionGeometry,
+  shiftLeft,
+  shiftRight,
+  step,
+  texture,
   uniform,
   varyingProperty,
   vec3,
   vec4,
   viewportSize,
 } from "three/tsl";
+import { CUT_WIDTH, CUT_WIDTH_SHIFT, MAX_CUT_DEPTH } from "./cut.js";
 
 /**
  * How points are coloured.
@@ -92,7 +110,34 @@ export interface PointCloudMaterial extends NodeMaterial {
   uMaxLevel: { value: number };
   uScalarMin: { value: number };
   uScalarMax: { value: number };
+  /**
+   * The octree-cut texture the vertex walk reads. Assign `.value` per frame;
+   * see {@link OctreeCut}. Until something does, it holds a 1x1 all-zero texel
+   * whose empty child mask stops the walk at depth 0 — which, through the
+   * `max(depth, level)` clamp, is exactly per-node sizing.
+   */
+  uCutMap: { value: DataTexture };
+  /** CLOUD-LOCAL min corner of the root box — the frame `pointOffset` is in. */
+  uRootMin: { value: { x: number; y: number; z: number } };
+  /** CLOUD-LOCAL extent of the root box, per axis. */
+  uRootSize: { value: { x: number; y: number; z: number } };
   colorMode: ColorMode;
+}
+
+/**
+ * A cut that terminates immediately.
+ *
+ * Not an error path: a cloud drawn before its first selection, a
+ * `PerNodeSink`, and any driver that never builds a cut all read this, get
+ * depth 0, and fall through the clamp to the node's own level.
+ */
+function emptyCut(): DataTexture {
+  const t = new DataTexture(new Uint8Array(4), 1, 1, RGBAFormat, UnsignedByteType);
+  t.minFilter = NearestFilter;
+  t.magFilter = NearestFilter;
+  t.generateMipmaps = false;
+  t.needsUpdate = true;
+  return t;
 }
 
 /**
@@ -214,6 +259,12 @@ export function createPointMaterial(
     ({ object }) => (object?.userData['level'] as number | undefined) ?? 0,
   );
 
+  // The octree cut, and the box the walk descends. Cloud-local, because
+  // `pointOffset` is.
+  const uCutMap = texture(emptyCut());
+  const uRootMin = uniform(vec3(0, 0, 0));
+  const uRootSize = uniform(vec3(1, 1, 1));
+
   m.vertexNode = Fn(() => {
     // ARENA LIVENESS. `color.w` is 255 for a live, currently-selected slot and 0
     // otherwise; multiplying the diameter by it collapses a dead instance to a
@@ -247,11 +298,122 @@ export function createPointMaterial(
       .div(z)
       .toVar('vkPF');
 
+    // LOCAL DEPTH. Descend the selected cut to the deepest node that contains
+    // this point, which is what decides how wide its splat may be. Sizing by
+    // the point's OWN node instead is the bug this exists to fix: every level
+    // above the frontier then draws 2**(D-L) too wide and paints over finer
+    // data that is already resident and already correct.
+    //
+    // From the ROOT rather than from the drawn node, which is the one place
+    // this diverges from the reference. The arena batches slabs by LEVEL, so
+    // there is no per-node uniform to carry a start offset and no per-point
+    // lane to spend four bytes on; the price is that the walk runs D steps
+    // instead of D - L.
+    const p = attribute('pointOffset', 'vec3');
+    const bMin = uRootMin.toVar('vkBMin');
+    const bSize = uRootSize.toVar('vkBSize');
+    const slot = int(0).toVar('vkSlot');
+    const depth = int(0).toVar('vkDepth');
+
+    Loop(MAX_CUT_DEPTH, () => {
+      // Linear slot to texel. CUT_WIDTH is a power of two precisely so this is
+      // a shift and a mask rather than an integer divide per step.
+      const texel = uCutMap
+        .load(
+          ivec2(
+            bitAnd(slot, int(CUT_WIDTH - 1)),
+            shiftRight(slot, int(CUT_WIDTH_SHIFT)),
+          ),
+        )
+        .toVar('vkTexel');
+      const mask = int(texel.r.mul(255).round()).toVar('vkMask');
+
+      const half = bSize.mul(0.5).toVar('vkHalf');
+      // `step(edge, x)` is `x >= edge`, matching the half-open split
+      // `makeChildNode` builds with `lo += size/2`.
+      const c = step(bMin.add(half), p).toVar('vkC');
+      // (x << 2) | (y << 1) | z — the format's own octant numbering.
+      const idx = int(c.x.mul(4).add(c.y.mul(2)).add(c.z)).toVar('vkIdx');
+
+      // Not selected, so its data is not on the GPU and this is as deep as the
+      // picture goes here.
+      If(bitAnd(mask, shiftLeft(int(1), idx)).equal(int(0)), () => {
+        Break();
+      });
+
+      const first = int(texel.g.mul(255).round())
+        .mul(65536)
+        .add(int(texel.b.mul(255).round()).mul(256))
+        .add(int(texel.a.mul(255).round()));
+
+      // Siblings are contiguous in breadth-first order, so the child sits at
+      // the run start plus the number of selected octants sorting before it.
+      // Unrolled at graph-build time: eight bits, no loop, no divergence.
+      const below = int(0).toVar('vkBelow');
+      for (let b = 0; b < 7; b++) {
+        below.addAssign(
+          bitAnd(shiftRight(mask, int(b)), int(1)).mul(
+            idx.greaterThan(int(b)).select(int(1), int(0)),
+          ),
+        );
+      }
+
+      slot.assign(first.add(below));
+      bMin.addAssign(c.mul(half));
+      bSize.assign(half);
+      depth.addAssign(int(1));
+    });
+
+    // CLAMPED AT THE NODE'S OWN LEVEL, never below it. The walk cannot
+    // legitimately land shallower — a drawn point's own node is selected and so
+    // is every ancestor — so a shallower answer only ever comes from float32
+    // ambiguity within about half a millimetre of a split plane. Clamping makes
+    // that case degrade to the size drawn before this feature existed rather
+    // than to a blob, and it is also what makes the empty-cut placeholder
+    // behave exactly like per-node sizing.
+    // MEASURED CAP OF ONE LEVEL, and the number is not taste.
+    //
+    // The cut says "the deepest resident node here is at depth D", and shrinking
+    // a coarse point by the full 2**(D-L) assumes the levels in between deliver
+    // enough points to refill the area it gave up. They do not always, and the
+    // gap is visible: with the full shrink, 5.4% of the screen went from painted
+    // at 13 s to background at 25 s — COVERAGE FALLING as more data arrived,
+    // which is the opposite of what streaming should do. Potree loses 1.2% over
+    // the same window, because it never shrinks: it sizes each point by its own
+    // node's spacing.
+    //
+    // Capping the shrink at one level takes that to 0.7%, better than Potree,
+    // and it is what took Speed Index from 5083 to 1918 (Potree: 1594) with
+    // visual completeness arriving at 21 s instead of 25 s.
+    //
+    // Two alternatives were measured and are worse. A bigger splat with the full
+    // shrink closes the holes only at 1.6x, and blurs: 13.1 of surface detail
+    // against 14.1 here. A cap of two levels keeps more detail (15.9) but leaves
+    // 3.6% falling and only 49% of the frame hole-free, against 59% here.
+    //
+    // Applied in BOTH rasterisers, and it has to be: they share this cut, so a
+    // cap in one and not the other would make them size splats differently and
+    // any A/B between them would be comparing two pictures, not two pipelines.
+    const shrink = depth
+      .sub(int(uNodeLevel))
+      .max(int(0))
+      .min(int(1))
+      .toVar('vkShrink');
+
     // A WORLD diameter, never a pixel size. A Potree level is a maximal
     // Poisson-disc sample with minimum distance s_L = spacing / 2**L;
     // maximality means every surface location is within s_L of a sample, so
-    // discs of radius s_L — diameter 2*s_L — cover with no holes.
-    const dWorld = uNodeSpacing.mul(2).mul(uSizeMultiplier).toVar('vkD0');
+    // discs of radius s_L — diameter 2*s_L — cover with no holes. Here s is the
+    // LOCAL pitch: the node's own, halved once per level the cut goes deeper.
+    //
+    // Scaling `uNodeSpacing` rather than recomputing from a root spacing keeps
+    // any per-node or per-format pitch override in play — only the local shrink
+    // is applied here.
+    const dWorld = uNodeSpacing
+      .div(exp2(float(shrink)))
+      .mul(2)
+      .mul(uSizeMultiplier)
+      .toVar('vkD0');
 
     // Clamp in PIXELS, then derive the world diameter back from the clamped
     // pixel size, so the quad and any radius varying always agree.
@@ -334,6 +496,9 @@ export function createPointMaterial(
   m.side = DoubleSide;
 
   Object.assign(m, {
+    uCutMap,
+    uRootMin,
+    uRootSize,
     uScalarMin,
     uScalarMax,
     uSizeMultiplier,

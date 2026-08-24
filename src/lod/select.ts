@@ -47,6 +47,12 @@ export interface LodTreeView {
   readonly nodeGeometricError?: Float64Array | undefined;
   readonly nodePointSpacing?: Float64Array | undefined;
   readonly nodeBoundingRadius?: Float64Array | undefined;
+  /**
+   * Own-layer point count, overriding `node.numPoints`, for a format that only
+   * learns the count when the payload arrives — a `tileset.json` declares none.
+   * The budget is charged from this when it is present.
+   */
+  readonly nodePointCount?: Float64Array | undefined;
   /** Format-native default for `targetScreenError`, device px. */
   readonly defaultScreenError?: number | undefined;
   /** SYNCHRONOUS, never throws, safe from a render loop. */
@@ -128,6 +134,44 @@ export interface LodOptions {
    * under-spending the budget exactly at the refinement frontier.
    */
   readonly maxBudgetSkips?: number;
+  /**
+   * Fraction of `pointBudget` withheld from refinement PAST
+   * {@link targetScreenError}. Default 0.15.
+   *
+   * The budget is spent in two tiers, and this splits them. A node whose
+   * projected error still exceeds the target is quality the caller ASKED for,
+   * and it may spend the whole budget. A node below the target is a bonus, and
+   * bonus nodes may only spend down to `pointBudget * (1 - budgetHeadroom)`.
+   * Because the heap is best-first the two tiers never interleave: every
+   * required node is popped before every bonus one.
+   *
+   * Withheld rather than spent because the leftover is what absorbs a camera
+   * move — the next frame's selection can grow into it without evicting, and
+   * the frame that grows is the frame that was already paying to stream.
+   *
+   * Setting this to 1 restores the pre-headroom behaviour: refinement stops
+   * dead at the target and the budget ceiling is never reached from below.
+   */
+  readonly budgetHeadroom?: number;
+  /**
+   * Hard floor on projected geometric error, DEVICE pixels. Refinement never
+   * descends past it however much budget is free. Clamped to at most
+   * `targetScreenError`.
+   *
+   * Default `targetScreenError / 4` — {@link BONUS_LEVELS} octree levels past
+   * the target, since a level halves the spacing. RELATIVE by default and not a
+   * constant, because a constant would make `targetScreenError` inert: with a
+   * fat budget every target above the floor would refine to the same floor, and
+   * the one knob that is supposed to trade quality for cost would stop doing
+   * anything. Asking for 8 px has to stay cheaper than asking for 0.5 px.
+   *
+   * Two levels is a 4x oversample cap. Past roughly 0.5 px absolute there is
+   * nothing left to win in any case: the material draws `2 * sizeMultiplier`
+   * spacings per splat, so below `minPixelSize / 2` every splat is pinned at
+   * `minPixelSize` and the extra points land in pixels that are already
+   * painted. Name this explicitly to cap there instead.
+   */
+  readonly minScreenError?: number;
 }
 
 /** Resolved options. The deprecated alias is collapsed away, never carried. */
@@ -137,10 +181,35 @@ export interface ResolvedLodOptions {
   readonly maxNodes: number;
   readonly maxLevel: number;
   readonly maxBudgetSkips: number;
+  readonly budgetHeadroom: number;
+  /** Already clamped to `<= targetScreenError`. */
+  readonly minScreenError: number;
 }
 
 /** The point-octree calibration. See `metric.ts` for where 1.35 px comes from. */
 export const DEFAULT_SCREEN_ERROR = 1.35;
+
+/**
+ * How many octree levels past `targetScreenError` the bonus tier may refine
+ * when the budget allows, and so the default `minScreenError` divisor.
+ *
+ * Two, and it is the knee rather than a round number. Swept on autzen at the
+ * 1.35 default against a 3M budget, points selected:
+ *
+ * | levels | close (0.25) | wide (0.9) |
+ * | --- | --- | --- |
+ * | 0 | 852,023 (L4) | 98,301 (L2) |
+ * | 1 | 1,759,577 (L5) | 308,828 (L3) |
+ * | 2 | **2,549,260 (L6)** | **1,002,851 (L4)** |
+ * | 3 | 2,549,260 (L6) | 2,549,741 (L5) |
+ *
+ * At two the close camera has already saturated the headroom, so a third level
+ * buys it nothing — while for the wide camera the third level is the one that
+ * runs it all the way to the ceiling for a picture 6 km away that cannot show
+ * the difference. One level leaves the close camera at 1.76M and a level short
+ * of the data that resolves stadium seating and parking bays.
+ */
+export const BONUS_LEVELS = 2;
 
 /**
  * The optional wasm kernel surface.
@@ -167,13 +236,22 @@ export function resolveLodOptions(
   /** The tree's `defaultScreenError`, when the caller named no target. */
   formatDefault: number = DEFAULT_SCREEN_ERROR,
 ): ResolvedLodOptions {
+  const target = o.targetScreenError ?? o.targetPixelSpacing ?? formatDefault;
   return {
-    targetScreenError:
-      o.targetScreenError ?? o.targetPixelSpacing ?? formatDefault,
+    targetScreenError: target,
     pointBudget: o.pointBudget ?? 3_000_000,
     maxNodes: o.maxNodes ?? 4096,
     maxLevel: o.maxLevel ?? Number.POSITIVE_INFINITY,
     maxBudgetSkips: o.maxBudgetSkips ?? 32,
+    // Clamped rather than validated: 1 is "no bonus tier", and a negative or
+    // >1 headroom is a caller slip that should not be able to invert the cap.
+    budgetHeadroom: Math.min(Math.max(o.budgetHeadroom ?? 0.15, 0), 1),
+    // NEVER above the target: the floor bounds how far PAST the ask the bonus
+    // tier may go, so a floor above the ask is meaningless.
+    minScreenError: Math.min(
+      o.minScreenError ?? target * 2 ** -BONUS_LEVELS,
+      target,
+    ),
   };
 }
 
@@ -227,12 +305,32 @@ export interface LodSelection {
   points: number;
   frame: number;
   /**
-   * Which constraint stopped refinement. `"error"` is the good case — the target
-   * spacing was met. This field exists because the reference has none, which is
-   * why nobody noticed `minimumNodePixelSize` is INERT at its shipped defaults:
-   * 150 px and 50 px give byte-identical autzen selections at 1500/300/80 m.
+   * Which constraint stopped refinement, worst first. This field exists because
+   * the reference has none, which is why nobody noticed `minimumNodePixelSize`
+   * is INERT at its shipped defaults: 150 px and 50 px give byte-identical
+   * autzen selections at 1500/300/80 m.
+   *
+   * - `"budget"` — the target was NOT met: the full budget bound first.
+   * - `"nodes"` — `maxNodes` bound first. Same meaning, different ceiling.
+   * - `"headroom"` — target met, and the bonus tier then hit
+   *   `pointBudget * (1 - budgetHeadroom)`.
+   * - `"error"` — target met, and refinement stopped at `minScreenError`. The
+   *   best case that still left something on the table.
+   * - `"complete"` — the tree ran out. Every point in the cloud is selected.
+   *
+   * Read it with {@link achievedScreenError}: this says WHAT bound, that says
+   * how much it cost.
    */
-  limitedBy: "complete" | "error" | "budget" | "nodes";
+  limitedBy: "complete" | "error" | "headroom" | "budget" | "nodes";
+  /**
+   * The WORST projected geometric error left un-refined, device px — the error
+   * in the sloppiest region of the picture. 0 when nothing was declined.
+   *
+   * Compare it against `targetScreenError` to know whether the ask was met:
+   * above means some region is coarser than requested, at or below means every
+   * region met it and the number is the quality actually delivered.
+   */
+  achievedScreenError: number;
   /**
    * Min POINT PITCH over ADMITTED nodes only — never the geometric error.
    * Drives near/far, whose rule is calibrated against the 24-bit depth quantum
@@ -254,6 +352,7 @@ export function createLodSelection(maxNodes = 4096): LodSelection {
     points: 0,
     frame: 0,
     limitedBy: "complete",
+    achievedScreenError: 0,
     minPointSpacingWorld: 0,
     maxSelectedLevel: 0,
     levelCounts: new Int32Array(MAX_LEVELS),
@@ -308,6 +407,7 @@ export function selectVisible(
   const errArr = tree.nodeGeometricError;
   const spcArr = tree.nodePointSpacing;
   const radArr = tree.nodeBoundingRadius;
+  const cntArr = tree.nodePointCount;
   // Whether the child loop must feed the kernel eight errors and eight radii
   // rather than one of each. Constant for the frame, so the kernel is told once
   // and the closed-form formats — every octree — keep writing exactly the two
@@ -320,8 +420,23 @@ export function selectVisible(
   let pts = 0;
   let skips = 0;
   let ne = 0;
-  let limitedBy: LodSelection["limitedBy"] = "complete";
+  // Which ceilings were actually touched, resolved into `limitedBy` once at the
+  // end. Flags rather than an assign-as-you-go string because the precedence is
+  // worst-first and the traversal meets them in no particular order.
+  let hitNodes = false;
+  let hitBudget = false;
+  let hitHeadroom = false;
+  let hitFloor = false;
+  /** Worst projected error left un-refined. See `achievedScreenError`. */
+  let worst = 0;
   let minSpacing = Infinity;
+  const target = opts.targetScreenError;
+  const floorPx = opts.minScreenError;
+  /**
+   * The ceiling for refinement PAST the target. Floored, so an integer point
+   * count is never compared against a fraction.
+   */
+  const bonusBudget = Math.floor(opts.pointBudget * (1 - opts.budgetHeadroom));
   let deepest = 0;
   out.levelCounts.fill(0);
 
@@ -330,6 +445,7 @@ export function selectVisible(
     out.points = 0;
     out.frame = frame;
     out.limitedBy = "complete";
+    out.achievedScreenError = 0;
     out.needsExpandCount = 0;
     out.minPointSpacingWorld = spcArr?.[tree.root.index] ?? tree.pointSpacingAt(0);
     out.maxSelectedLevel = 0;
@@ -357,11 +473,14 @@ export function selectVisible(
 
   while (heap > 0) {
     if (n >= opts.maxNodes) {
-      limitedBy = "nodes";
+      hitNodes = true;
       break;
     }
     heap = heapPop(s, heap);
     const i = s.popNode;
+    // CAPTURED, not read later: the next `heapPop` overwrites `s.popKey`, and
+    // this node's key is what decides which of the two budget tiers it is in.
+    const key = s.popKey;
     const containment = s.popContainment;
     let node = tree.node(i);
     if (node === undefined) continue;
@@ -369,13 +488,25 @@ export function selectVisible(
     // BUDGET: skip and continue, never break. The ROOT is exempt — it is the
     // connectivity anchor and 0.1% of the cloud, and a budget below it must
     // still show something.
-    if (i !== rootIndex && pts + node.numPoints > opts.pointBudget) {
-      limitedBy = "budget";
+    //
+    // TWO CEILINGS. A node still above the target is quality that was asked
+    // for and may spend the whole budget; one below it is a bonus and may only
+    // spend down to the headroom. The heap is best-first and the key never
+    // rises as it descends, so the tiers cannot interleave — every required
+    // node is popped before every bonus one, and this branch flips exactly once
+    // per traversal.
+    const required = key >= target;
+    const cap = required ? opts.pointBudget : bonusBudget;
+    const own = cntArr !== undefined ? cntArr[i]! : node.numPoints;
+    if (i !== rootIndex && pts + own > cap) {
+      if (required) hitBudget = true;
+      else hitHeadroom = true;
+      if (key > worst) worst = key;
       if (++skips > opts.maxBudgetSkips) break;
       continue;
     }
 
-    pts += node.numPoints;
+    pts += own;
     s.visibleEpoch[i] = frame;
     out.indices[n++] = i;
     const lvl = node.level;
@@ -385,6 +516,8 @@ export function selectVisible(
     const sp = spcArr !== undefined ? spcArr[i]! : tree.pointSpacingAt(lvl);
     if (sp < minSpacing) minSpacing = sp;
 
+    // TRI-STATE, not a bit test: `0` is a leaf whatever the format, and an
+    // octree's octant bits are a meaning this loop deliberately does not read.
     if (node.childMask === 0) continue; // 80.5% of autzen nodes
     if (node.childMask === undefined) {
       if (!tree.tryExpandSync(node)) {
@@ -405,55 +538,81 @@ export function selectVisible(
     const rChildLevel = tree.boundingRadiusAt(lvl + 1);
     const eChildLevel = tree.geometricErrorAt(lvl + 1);
 
+    const kids = node.children;
+    const numKids = kids.length;
+
     if (useKernel) {
-      // ONE boundary crossing per admitted node, not per child: the arithmetic
+      // ONE boundary crossing per EIGHT children, not per child: the arithmetic
       // per child is comparable to the cost of a crossing, so per-child calls
-      // would be a wash.
+      // would be a wash. Eight is the kernel's fixed block — every octree has
+      // exactly that many slots and pays one crossing per admitted node, and an
+      // N-ary tile tree pays ceil(N/8) without the kernel changing a byte.
       const { boxes, results, params, child: childBlock } = kernels!;
-      let mask = 0;
-      for (let c = 0; c < 8; c++) {
-        const child = node.children[c];
-        if (child === undefined) continue;
-        const o = c * 6;
-        boxes[o] = child.minX;
-        boxes[o + 1] = child.minY;
-        boxes[o + 2] = child.minZ;
-        boxes[o + 3] = child.maxX;
-        boxes[o + 4] = child.maxY;
-        boxes[o + 5] = child.maxZ;
-        // Filled in the SAME pass that fills the boxes, so the per-child path
-        // costs writes and not a second walk of the child slots.
-        if (perChild) {
-          childBlock[c] =
-            errArr !== undefined ? errArr[child.index]! : eChildLevel;
-          childBlock[8 + c] =
-            radArr !== undefined ? radArr[child.index]! : rChildLevel;
-        }
-        mask |= 1 << c;
-      }
       params[3] = rChildLevel;
       params[4] = eChildLevel;
 
-      const survived = kernels!.selectChildren(
-        mask,
-        containment === Containment.Inside,
-      );
-      for (let c = 0; c < 8; c++) {
-        if (((survived >> c) & 1) === 0) continue;
-        const child = node.children[c]!;
-        const key = results[c * 2 + 1]!;
-        if (key < opts.targetScreenError) {
-          if (limitedBy === "complete") limitedBy = "error";
-          continue;
+      for (let base = 0; base < numKids; base += 8) {
+        const span = numKids - base < 8 ? numKids - base : 8;
+        let mask = 0;
+        for (let c = 0; c < span; c++) {
+          const child = kids[base + c];
+          if (child === undefined) continue;
+          const o = c * 6;
+          boxes[o] = child.minX;
+          boxes[o + 1] = child.minY;
+          boxes[o + 2] = child.minZ;
+          boxes[o + 3] = child.maxX;
+          boxes[o + 4] = child.maxY;
+          boxes[o + 5] = child.maxZ;
+          // Filled in the SAME pass that fills the boxes, so the per-child path
+          // costs writes and not a second walk of the child slots.
+          if (perChild) {
+            childBlock[c] =
+              errArr !== undefined ? errArr[child.index]! : eChildLevel;
+            childBlock[8 + c] =
+              radArr !== undefined ? radArr[child.index]! : rChildLevel;
+          }
+          mask |= 1 << c;
         }
-        heap = heapPush(s, heap, child.index, key, results[c * 2] as Containment);
-        s.pushes++;
+
+        const survived = kernels!.selectChildren(
+          mask,
+          containment === Containment.Inside,
+        );
+        for (let c = 0; c < span; c++) {
+          if (((survived >> c) & 1) === 0) continue;
+          const child = kids[base + c]!;
+          const ckey = results[c * 2 + 1]!;
+          // FLOOR: below this no amount of budget can change a pixel.
+          if (ckey < floorPx) {
+            hitFloor = true;
+            if (ckey > worst) worst = ckey;
+            continue;
+          }
+          // A bonus child that cannot possibly fit. `pts` only grows, so
+          // failing the headroom cap here means failing it at every later pop
+          // too — pruning at push is what makes `budgetHeadroom: 1` cost
+          // nothing instead of burning `maxBudgetSkips` on doomed pops.
+          if (ckey < target && pts >= bonusBudget) {
+            hitHeadroom = true;
+            if (ckey > worst) worst = ckey;
+            continue;
+          }
+          heap = heapPush(
+            s,
+            heap,
+            child.index,
+            ckey,
+            results[c * 2] as Containment,
+          );
+          s.pushes++;
+        }
       }
       continue;
     }
 
-    for (let c = 0; c < 8; c++) {
-      const child = node.children[c];
+    for (let c = 0; c < numKids; c++) {
+      const child = kids[c];
       if (child === undefined) continue;
 
       // CULL AT PUSH — the reference culls at pop, so every off-screen child is
@@ -489,20 +648,48 @@ export function selectVisible(
         ? cam.orthoProjFactor
         : (0.5 * cam.viewportHeightPx) / (cam.slope * d);
 
-      const key = eChild * pf; // projected geometric error, device px
-      if (key < opts.targetScreenError) {
-        if (limitedBy === "complete") limitedBy = "error";
+      const ckey = eChild * pf; // projected geometric error, device px
+      // FLOOR: below this no amount of budget can change a pixel.
+      if (ckey < floorPx) {
+        hitFloor = true;
+        if (ckey > worst) worst = ckey;
         continue;
       }
-      heap = heapPush(s, heap, child.index, key, cc);
+      // A bonus child that cannot possibly fit. `pts` only grows, so failing
+      // the headroom cap here means failing it at every later pop too —
+      // pruning at push is what makes `budgetHeadroom: 1` cost nothing
+      // instead of burning `maxBudgetSkips` on doomed pops.
+      if (ckey < target && pts >= bonusBudget) {
+        hitHeadroom = true;
+        if (ckey > worst) worst = ckey;
+        continue;
+      }
+      heap = heapPush(s, heap, child.index, ckey, cc);
       s.pushes++;
     }
   }
 
+  // Whatever is still on the heap was never even looked at, and the max-heap
+  // root is the worst of it. Without this a traversal abandoned by
+  // `maxBudgetSkips` or `maxNodes` would report the error of the last node it
+  // happened to reject rather than of the region it gave up on.
+  if (heap > 0 && s.heapKey[0]! > worst) worst = s.heapKey[0]!;
+
   out.count = n;
   out.points = pts;
   out.frame = frame;
-  out.limitedBy = limitedBy;
+  // WORST FIRST. `budget` and `nodes` mean the target was missed; `headroom`
+  // and `error` mean it was met and only the bonus tier was cut short.
+  out.limitedBy = hitNodes
+    ? "nodes"
+    : hitBudget
+      ? "budget"
+      : hitHeadroom
+        ? "headroom"
+        : hitFloor
+          ? "error"
+          : "complete";
+  out.achievedScreenError = worst;
   out.needsExpandCount = ne;
   out.maxSelectedLevel = deepest;
   out.minPointSpacingWorld =

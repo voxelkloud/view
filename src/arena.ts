@@ -18,6 +18,12 @@ import type { PointReadback } from "./sink.js";
  */
 export interface ArenaBlock {
   readonly level: number;
+  /**
+   * Which slab list this block lives in. EQUAL TO `level` for every tree whose
+   * point pitch is a closed form of the level — which is every octree format —
+   * and a spacing bucket otherwise. See {@link PointArena.allocate}.
+   */
+  readonly key: number;
   readonly slab: number;
   /** First point slot. */
   readonly start: number;
@@ -50,6 +56,9 @@ interface FreeRun {
 
 interface Slab {
   readonly level: number;
+  readonly key: number;
+  /** What the mesh's `spacingWorld` uniform was stamped with. */
+  readonly spacingWorld: number;
   readonly capacity: number;
   readonly pages: number;
   readonly positions: Float32Array;
@@ -69,11 +78,46 @@ interface Slab {
   dirty: boolean;
 }
 
+/**
+ * The unit quad, four corners and six indices.
+ *
+ * A three-vertex triangle circumscribing the same disc was tried and reverted.
+ * It cut vertices per splat by 25% and INP did not move (296-352 ms against
+ * 320-324), while the triangle's 30% larger envelope cost idle frame rate
+ * (58.1-59.2 fps against 59.9).
+ *
+ * That null result sharpened the model. INP scales with INSTANCES — 3.0M gives
+ * ~320 ms, 2.0M gives 180, 1.0M gives 120, 750k gives 76 — and not with
+ * vertices per instance. So the cost is per-instance work: stepping the
+ * instanced attributes and fetching `pointOffset`, `color` and `scalarValue`
+ * once per splat, which happens whatever the envelope is. Potree pays none of
+ * it because `gl.POINTS` has no instancing at all.
+ *
+ * The consequence is that no envelope change can close this gap; only drawing
+ * fewer instances, or leaving the instanced-draw model altogether.
+ */
 const CORNERS = new Float32Array([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0]);
 const CORNER_INDEX = [0, 1, 2, 0, 2, 3];
 
 /**
- * A level-partitioned slab allocator for point data.
+ * A slab key for a pitch that is NOT the level's closed form.
+ *
+ * QUARTER-OCTAVE buckets: two pitches share a slab only within a factor of
+ * 2^(1/4), so a point is drawn within 9% of its own pitch — well under the
+ * error the splat's own quad rounding already carries, and enough to keep a
+ * tileset from opening one slab per distinct tile error.
+ *
+ * NEGATIVE, so a bucket can never collide with a plain level key: levels are
+ * small non-negative integers and these are not.
+ */
+function bucketKey(level: number, spacingWorld: number): number {
+  const q = Math.round(Math.log2(spacingWorld) * 4);
+  const clamped = q < -2048 ? -2048 : q > 2047 ? 2047 : q;
+  return -(1 + level * 4096 + (clamped + 2048));
+}
+
+/**
+ * A pitch-partitioned slab allocator for point data.
  *
  * ONE `Mesh` per slab instead of one per node, which is the whole point: autzen
  * at a 3M budget selects 338-1184 nodes, so per-node meshes mean that many draw
@@ -82,11 +126,20 @@ const CORNER_INDEX = [0, 1, 2, 0, 2, 3];
  * per-object uniform buffer, so per-node objects leak one buffer per node ever
  * attached, where an arena leaks at most one per slab.
  *
- * Slabs are partitioned BY LEVEL because the material reads `spacingWorld` and
- * `level` as per-object uniforms. Those land in the object bind group and so
- * never touch the pipeline cache key — which is what makes adaptive point size
- * cost zero bytes per point. Mixing levels in one slab would force size to
- * become per-point data.
+ * Slabs are partitioned BY POINT PITCH because the material reads
+ * `spacingWorld` and `level` as per-object uniforms. Those land in the object
+ * bind group and so never touch the pipeline cache key — which is what makes
+ * adaptive point size cost zero bytes per point. Mixing pitches in one slab
+ * would force size to become per-point data.
+ *
+ * For every format whose pitch is a closed form of the level — Potree v2, COPC,
+ * EPT, every octree — the partition IS the level, exactly and by construction:
+ * `allocate` compares the pitch it is given against `pointSpacingAt(level)` and
+ * keys on the level when they are the same number. A format that carries a
+ * per-node pitch (a tileset, whose tiles at one depth are not one size) keys on
+ * a QUARTER-OCTAVE bucket instead, so points inside a slab are drawn within 9%
+ * of their own pitch and the slab count stays bounded. That the two cases are
+ * decided by one equality, in one place, is what keeps the common one free.
  *
  * Sub-range draws are NOT available: `RenderObject.getDrawParameters` never
  * offsets `firstInstance` off the BatchedMesh path, and `geometry.groups` bound
@@ -98,7 +151,7 @@ const CORNER_INDEX = [0, 1, 2, 0, 2, 3];
  * be pure overdraw.
  */
 export class PointArena {
-  private readonly slabsByLevel = new Map<number, Slab[]>();
+  private readonly slabsByKey = new Map<number, Slab[]>();
   private readonly allSlabs: Slab[] = [];
   private readonly slabCapacity: number;
   private readonly pageSize: number;
@@ -124,6 +177,21 @@ export class PointArena {
     this.maxLivenessOpsPerFrame = options.maxLivenessOpsPerFrame ?? 128;
   }
 
+  /**
+   * Instance slots the vertex stage actually processes, summed over slabs.
+   *
+   * `slab.highWater`, not attached points and not `residentBytes` — the first
+   * undercounts because a freed block below the high-water mark still costs a
+   * vertex invocation, and the second is slab CAPACITY, which includes page
+   * slack. This is the number the draw dispatches, so it is the one the
+   * mask-versus-compact question turns on.
+   */
+  get residentPoints(): number {
+    let n = 0;
+    for (const slab of this.allSlabs) n += slab.highWater;
+    return n;
+  }
+
   get residentBytes(): number {
     return this.bytes;
   }
@@ -137,14 +205,35 @@ export class PointArena {
     return n;
   }
 
-  /** Allocate `numPoints` slots at `level`, growing the level if needed. */
-  allocate(level: number, numPoints: number): ArenaBlock | undefined {
+  /**
+   * Allocate `numPoints` slots for a node at `level` whose points are drawn at
+   * `spacingWorld`.
+   *
+   * `spacingWorld` is optional and defaults to the level's closed form, which
+   * is what every octree format wants and what this did before per-node pitches
+   * existed. Passing the SAME number the closed form would produce is also
+   * free: the key is then the level and not a bucket, so nothing about the
+   * partition moves.
+   */
+  allocate(
+    level: number,
+    numPoints: number,
+    spacingWorld?: number,
+  ): ArenaBlock | undefined {
     if (numPoints <= 0) return undefined;
+    const closed = this.pointSpacingAt(level);
+    const pitch =
+      spacingWorld === undefined ||
+      !Number.isFinite(spacingWorld) ||
+      spacingWorld <= 0
+        ? closed
+        : spacingWorld;
+    const key = pitch === closed ? level : bucketKey(level, pitch);
     const pages = Math.ceil(numPoints / this.pageSize);
-    let list = this.slabsByLevel.get(level);
+    let list = this.slabsByKey.get(key);
     if (list === undefined) {
       list = [];
-      this.slabsByLevel.set(level, list);
+      this.slabsByKey.set(key, list);
     }
 
     for (let s = 0; s < list.length; s++) {
@@ -164,7 +253,7 @@ export class PointArena {
         ? Math.min(this.slabCapacity, Math.max(16_384, pages * this.pageSize))
         : this.slabCapacity;
     const capacity = Math.max(wanted, pages * this.pageSize);
-    const slab = this.createSlab(level, capacity);
+    const slab = this.createSlab(level, key, pitch, capacity);
     list.push(slab);
     return this.allocateIn(slab, list.length - 1, pages, numPoints);
   }
@@ -186,14 +275,21 @@ export class PointArena {
       const end = start + numPoints;
       if (end > slab.highWater) slab.highWater = end;
       slab.dirty = true;
-      return { level: slab.level, slab: slabIndex, start, count: numPoints, pages };
+      return {
+        level: slab.level,
+        key: slab.key,
+        slab: slabIndex,
+        start,
+        count: numPoints,
+        pages,
+      };
     }
     return undefined;
   }
 
   /** Return a block's pages, coalescing with neighbours. */
   free(block: ArenaBlock): void {
-    const slab = this.slabsByLevel.get(block.level)?.[block.slab];
+    const slab = this.slabsByKey.get(block.key)?.[block.slab];
     if (slab === undefined) return;
     const page = block.start / this.pageSize;
 
@@ -238,7 +334,7 @@ export class PointArena {
     needsAlphaStamp: boolean,
     scalars?: Float32Array | undefined,
   ): void {
-    const slab = this.slabsByLevel.get(block.level)?.[block.slab];
+    const slab = this.slabsByKey.get(block.key)?.[block.slab];
     if (slab === undefined) return;
     slab.positions.set(positions.subarray(0, 3 * block.count), 3 * block.start);
     if (colors === undefined) {
@@ -266,7 +362,7 @@ export class PointArena {
   }
 
   readPoints(block: ArenaBlock): PointReadback | undefined {
-    const slab = this.slabsByLevel.get(block.level)?.[block.slab];
+    const slab = this.slabsByKey.get(block.key)?.[block.slab];
     if (slab === undefined) return undefined;
     return {
       positions: slab.positions,
@@ -279,7 +375,7 @@ export class PointArena {
 
   /** Write `v` into every alpha byte of a block — the liveness mask. */
   setAlpha(block: ArenaBlock, v: number): void {
-    const slab = this.slabsByLevel.get(block.level)?.[block.slab];
+    const slab = this.slabsByKey.get(block.key)?.[block.slab];
     if (slab === undefined) return;
     const end = 4 * (block.start + block.count);
     for (let o = 4 * block.start + 3; o < end; o += 4) slab.colors[o] = v;
@@ -307,7 +403,12 @@ export class PointArena {
     }
   }
 
-  private createSlab(level: number, capacity: number): Slab {
+  private createSlab(
+    level: number,
+    key: number,
+    spacingWorld: number,
+    capacity: number,
+  ): Slab {
     const pages = Math.ceil(capacity / this.pageSize);
     const slots = pages * this.pageSize;
     const positions = new Float32Array(3 * slots);
@@ -348,12 +449,14 @@ export class PointArena {
     mesh.matrixAutoUpdate = false;
     mesh.visible = false;
     mesh.updateMatrix();
-    mesh.userData['spacingWorld'] = this.pointSpacingAt(level);
+    mesh.userData['spacingWorld'] = spacingWorld;
     mesh.userData['level'] = level;
     this.parent.add(mesh);
 
     const slab: Slab = {
       level,
+      key,
+      spacingWorld,
       capacity: slots,
       pages,
       positions,
@@ -381,7 +484,7 @@ export class PointArena {
       slab.geometry.dispose();
     }
     this.allSlabs.length = 0;
-    this.slabsByLevel.clear();
+    this.slabsByKey.clear();
     this.bytes = 0;
   }
 }

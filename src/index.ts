@@ -21,6 +21,9 @@ export type {
 export { createEdlPipeline, resolveEdlOptions } from "./edl.js";
 export type { EdlOptions, EdlPipeline, ResolvedEdlOptions } from "./edl.js";
 
+export { OctreeCut } from "./cut.js";
+export { BlockAllocator, ComputeRasterizer, ComputeSink } from "./sink-compute.js";
+export type { ComputeSinkOptions } from "./sink-compute.js";
 export { PointCloudObject3D } from "./object.js";
 export { pickPoint } from "./pick.js";
 export type { PickPointOptions, PickResult } from "./pick.js";
@@ -28,6 +31,8 @@ export { PerNodeSink } from "./sink.js";
 export type { PointReadback, PointSink } from "./sink.js";
 export { ArenaSink } from "./sink-arena.js";
 export { PointArena } from "./arena.js";
+export { createReplaceScratch, filterReplacedParents } from "./replace.js";
+export type { ReplaceScratch, ReplaceTreeView } from "./replace.js";
 export type { ArenaBlock, ArenaOptions } from "./arena.js";
 
 export {

@@ -59,6 +59,10 @@ export class ArenaSink implements PointSink {
   get residentBytes(): number {
     return this.arena.residentBytes;
   }
+
+  get residentPoints(): number {
+    return this.arena.residentPoints;
+  }
   get nodeCount(): number {
     return this.blocks.size;
   }
@@ -77,7 +81,7 @@ export class ArenaSink implements PointSink {
   attach(
     index: number,
     data: DecodedPointData,
-    _spacingWorld: number,
+    spacingWorld: number,
     level: number,
   ): number {
     if (this.blocks.has(index)) return 0;
@@ -90,7 +94,10 @@ export class ArenaSink implements PointSink {
     const colors =
       data.colors?.array instanceof Uint8Array ? data.colors.array : undefined;
 
-    const block = this.arena.allocate(level, data.numPoints);
+    // The pitch is the caller's, not the level's: on a closed-form tree the two
+    // are the same number and the arena keys on the level exactly as before, and
+    // on a per-node one this is the only place the real pitch is known.
+    const block = this.arena.allocate(level, data.numPoints, spacingWorld);
     if (block === undefined) return 0;
 
     // Task 4's `f32` gpu lane, so the raw value arrives as a Float32Array and
@@ -136,6 +143,21 @@ export class ArenaSink implements PointSink {
     this.shownEpoch.delete(index);
   }
 
+  /**
+   * MASKS, it does not compact — and that is where INP is lost.
+   *
+   * A hidden point keeps its slot and its instance, so `geometry.instanceCount`
+   * still covers every RESIDENT point and the vertex stage runs for all of
+   * them; only the fragment work goes away. Measured on autzen at 0.25 with a
+   * scripted drag: 3.0M resident gives an INP of 328-368 ms and 1.0M resident
+   * gives 112-128, while shrinking the SELECTION to a third at 3.0M resident
+   * changed nothing. Every LOD knob addresses selection, so none of them can
+   * reach this.
+   *
+   * Fixing it means compacting the live points into a contiguous prefix and
+   * drawing only that — a real change, because the arena's whole point is that
+   * a node's block never moves.
+   */
   setVisible(indices: Int32Array, count: number): void {
     const epoch = ++this.epoch;
     const max = this.arena.maxLivenessOpsPerFrame;
