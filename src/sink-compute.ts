@@ -4,6 +4,7 @@ import { COMPUTE_WGSL } from "./compute-wgsl.js";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
 import type { PointReadback, PointSink } from "./sink.js";
+import { toZeroToOneDepth } from "./clip.js";
 
 /** The index the shader switches on, in the order {@link ColorMode} declares. */
 const MODE_INDEX: Record<ColorMode["kind"], number> = {
@@ -55,8 +56,44 @@ const gpuData = (v: ArrayBufferView): GPUAllowSharedBufferSource =>
  * buffers — which is also what makes them occlude each other correctly — and
  * one resolve reads the result out.
  */
+/**
+ * RGBA bytes for the GPU, whatever width the driver decoded.
+ *
+ * Only `Uint8Array` used to pass here and everything else was dropped in
+ * silence — which turned any LAS carrying 16-bit RGB into a pure black cloud,
+ * because the colour buffer stayed zero. That is most aerial survey data.
+ *
+ * The narrowing is by the WIDEST channel seen, not a fixed `>> 8`: plenty of
+ * files store 0..255 inside 16-bit fields, and shifting those leaves every
+ * channel at zero — the same trap the CLI's thumbnail renderer fell into on
+ * this exact dataset.
+ */
+function narrowColors(src: ArrayLike<number> | undefined): Uint8Array | undefined {
+  if (src === undefined) return undefined;
+  if (src instanceof Uint8Array) return src;
+  if (!(src instanceof Uint16Array)) return undefined;
+  let max = 0;
+  for (let i = 0; i < src.length; i++) if (src[i]! > max) max = src[i]!;
+  const out = new Uint8Array(src.length);
+  if (max <= 255) {
+    for (let i = 0; i < src.length; i++) out[i] = src[i]!;
+    return out;
+  }
+  const scale = 255 / max;
+  for (let i = 0; i < src.length; i++) out[i] = Math.min(255, Math.round(src[i]! * scale));
+  return out;
+}
+
+/** Depth format for the overlay attachment. 24-bit plus stencil is universal. */
+export const OVERLAY_DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
+
 export class ComputeRasterizer {
   private depthBuf: GPUBuffer | undefined;
+  /**
+   * A real depth attachment, used ONLY so overlay meshes occlude each other.
+   * The points' own depth stays in `depthBuf`; nothing is copied between them.
+   */
+  private overlayDepth: GPUTexture | undefined;
   private accumBuf: GPUBuffer | undefined;
   private bind: GPUBindGroup | undefined;
   private pixels = 0;
@@ -138,6 +175,12 @@ export class ComputeRasterizer {
       });
     this.depthBuf = mk(this.pixels * 4);
     this.accumBuf = mk(this.pixels * 16);
+    this.overlayDepth?.destroy();
+    this.overlayDepth = this.device.createTexture({
+      size: { width, height },
+      format: OVERLAY_DEPTH_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
     this.bind = this.device.createBindGroup({
       layout: this.layout,
       entries: [
@@ -171,22 +214,44 @@ export class ComputeRasterizer {
     return enc;
   }
 
-  /** Resolve to the swapchain and submit everything the frame encoded. */
-  end(enc: GPUCommandEncoder): void {
+  /**
+   * Resolve to the swapchain and submit everything the frame encoded.
+   *
+   * `overlay` runs inside the SAME pass, right after the resolve triangle, so
+   * app geometry composites with the points instead of overwriting them.
+   */
+  end(enc: GPUCommandEncoder, overlay?: (pass: GPURenderPassEncoder) => void): void {
+    const view = this.context.getCurrentTexture().createView();
     const rp = enc.beginRenderPass({
       colorAttachments: [
-        {
-          view: this.context.getCurrentTexture().createView(),
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        },
+        { view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } },
       ],
     });
     rp.setPipeline(this.drawPipe);
     rp.setBindGroup(0, this.bind!);
     rp.draw(3);
     rp.end();
+
+    // A SECOND pass, not a continuation of the first.
+    //
+    // The resolve binds the point depth as read-write storage (its shader uses
+    // atomics), and the overlay reads the same buffer. WebGPU forbids a
+    // buffer being writable and readable in one synchronisation scope, and a
+    // render pass is one scope — so the overlay gets its own, loading the
+    // colour the resolve just wrote instead of clearing it.
+    if (overlay !== undefined) {
+      const op = enc.beginRenderPass({
+        colorAttachments: [{ view, loadOp: "load", storeOp: "store" }],
+        depthStencilAttachment: {
+          view: this.overlayDepth!.createView(),
+          depthClearValue: 1,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+        },
+      });
+      overlay(op);
+      op.end();
+    }
     this.device.queue.submit([enc.finish()]);
   }
 
@@ -195,6 +260,7 @@ export class ComputeRasterizer {
     this.disposed = true;
     this.depthBuf?.destroy();
     this.accumBuf?.destroy();
+    this.overlayDepth?.destroy();
     this.uniBuf.destroy();
   }
 }
@@ -513,7 +579,7 @@ export class ComputeSink implements PointSink {
       this.scalarCpu?.set(scalar.subarray(0, n), start);
       staged += 4 * n;
     } else {
-      const colors = data.colors?.array instanceof Uint8Array ? data.colors.array : undefined;
+      const colors = narrowColors(data.colors?.array);
       if (colors !== undefined) {
         // RGBA bytes ARE the u32 the shader reads, on a little-endian host:
         // byte 0 lands in the low 8 bits, which is where `shade` looks for red.
@@ -629,10 +695,9 @@ export class ComputeSink implements PointSink {
     if (this.bind === undefined) return;
     const o = this.options;
 
-    const m = camera.projectionMatrix
-      .clone()
-      .multiply(camera.matrixWorldInverse)
-      .multiply(modelMatrix);
+    const m = toZeroToOneDepth(
+      camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse).multiply(modelMatrix),
+    );
     this.uf.set(m.elements, 0);
     this.uf[16] = width;
     this.uf[17] = height;

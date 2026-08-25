@@ -50,6 +50,7 @@ import type { EdlOptions, EdlPipeline } from "./edl.js";
 import { PointCloudObject3D } from "./object.js";
 import { pickPoint as pickPointOnClouds } from "./pick.js";
 import type { PickPointOptions, PickResult } from "./pick.js";
+import { GroundIndex, type GroundIndexOptions } from "./ground.js";
 import { extractProfile as extractProfileFromCloud } from "./profile/index.js";
 import type {
   ProfileBatch,
@@ -59,7 +60,8 @@ import type {
 import { createReplaceScratch, filterReplacedParents } from "./replace.js";
 import type { ReplaceScratch, ReplaceTreeView } from "./replace.js";
 import { ArenaSink } from "./sink-arena.js";
-import { ComputeRasterizer, ComputeSink } from "./sink-compute.js";
+import { OverlayRenderer } from "./overlay.js";
+import { ComputeRasterizer, ComputeSink, OVERLAY_DEPTH_FORMAT } from "./sink-compute.js";
 import { PerNodeSink } from "./sink.js";
 import type { PointSink } from "./sink.js";
 
@@ -461,6 +463,7 @@ export class PointCloudView {
   };
 
   private readonly clouds: CloudHandle[] = [];
+  private readonly groundIndices = new Map<number, GroundIndex>();
   /**
    * Whether the CALLER named a target. Only when they did not may a cloud's
    * format-native `defaultScreenError` take over — an explicit 1.35 must not be
@@ -493,6 +496,7 @@ export class PointCloudView {
    * after `init`, because it needs the device three opened.
    */
   private raster: ComputeRasterizer | undefined;
+  private overlay: OverlayRenderer | undefined;
   /** What actually drew, after capability resolution. Public so a caller can
    *  see that a compute request fell back rather than guess from a frame time. */
   rasterizer: "compute" | "instanced" = "instanced";
@@ -827,6 +831,71 @@ export class PointCloudView {
   }
 
   /**
+   * The overlay renderer, or undefined when the scene holds nothing to draw.
+   *
+   * Checked per frame so an app that adds nothing pays nothing beyond a walk
+   * of the scene's direct children.
+   */
+  private overlayFor(): OverlayRenderer | undefined {
+    if (this.scene.children.length === 0) return undefined;
+    const device = (this.renderer as unknown as { backend?: { device?: GPUDevice } }).backend
+      ?.device;
+    if (device === undefined) return undefined;
+    this.overlay ??= new OverlayRenderer(
+      device,
+      navigator.gpu.getPreferredCanvasFormat(),
+      OVERLAY_DEPTH_FORMAT,
+    );
+    // Nobody else updates these. On the compute path `renderer.render(scene)`
+    // never runs, so three never walks the graph — a mesh whose local
+    // transform was set still has an IDENTITY world matrix, and draws at the
+    // scene origin instead of where the app put it. That cost an afternoon.
+    this.scene.updateMatrixWorld(true);
+    const clouds = new Set(this.clouds.map((h) => h.object as unknown as object));
+    return this.overlay.collect(this.scene, clouds) ? this.overlay : undefined;
+  }
+
+  /**
+   * A synchronous height/obstacle index over the points currently resident.
+   *
+   * Exists for callers that run inside a frame — a vehicle, a first-person
+   * walker, a collision probe — and cannot await a traversal. It answers from
+   * the cut the scheduler has already chosen, so the answer is as detailed as
+   * what is on screen and no more; `support` on each sample says how much data
+   * stood behind it.
+   *
+   * The index rebuilds itself only when the resident set changes, so calling
+   * this every frame is free after the first.
+   */
+  groundIndex(cloudIndex = 0, options?: GroundIndexOptions): GroundIndex | undefined {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return undefined;
+    let index = this.groundIndices.get(cloudIndex);
+    if (index === undefined) {
+      index = new GroundIndex();
+      this.groundIndices.set(cloudIndex, index);
+    }
+    // The selected-node count and the newest node index together change
+    // whenever the cut does, and both are already maintained per frame.
+    const token =
+      h.selection.count * 1_000_003 +
+      (h.selection.count > 0 ? h.selection.indices[h.selection.count - 1]! : 0);
+    index.rebuild(
+      {
+        selection: h.selection.indices,
+        selectionCount: h.selection.count,
+        sceneOrigin: h.object.getSceneOrigin() as [number, number, number],
+        cloudOrigin: h.object.cloudOrigin as [number, number, number],
+        node: (i: number) => h.hierarchy.node(i),
+        readPoints: (i: number) => h.sink.readPoints(i),
+      },
+      token,
+      options ?? {},
+    );
+    return index;
+  }
+
+  /**
    * Pick the closest point currently selected by the scheduler.
    */
   pickPoint(
@@ -1093,7 +1162,23 @@ export class PointCloudView {
             this.drawSize.y,
           );
         }
-        this.raster.end(enc);
+        // Anything the app put in the scene, composited INSIDE the resolve
+        // pass: mutual occlusion with the points, because the fragment shader
+        // reads their depth buffer directly.
+        const overlay = this.overlayFor();
+        this.raster.end(
+          enc,
+          overlay === undefined
+            ? undefined
+            : (pass) =>
+                overlay.record(
+                  pass,
+                  this.camera,
+                  this.raster!.depth!,
+                  this.drawSize.x,
+                  this.drawSize.y,
+                ),
+        );
       }
     }
     // EDL owns the draw when it is on: it renders the scene into its own target
@@ -1395,6 +1480,8 @@ export class PointCloudView {
   dispose(): void {
     this.raster?.dispose();
     this.raster = undefined;
+    this.overlay?.dispose();
+    this.overlay = undefined;
     if (this.disposed) return;
     this.disposed = true;
     for (const h of this.clouds) {

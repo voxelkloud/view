@@ -1,0 +1,70 @@
+
+/* ---- drive demo --------------------------------------------------------- */
+.drive-shell { position: fixed; inset: 0; background: var(--bg); overflow: hidden; }
+.drive-car {
+  position: absolute;
+  left: 50%;
+  top: 58%;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border-radius: 3px;
+  background: #ff5d5d;
+  box-shadow: 0 0 0 2px rgba(11, 13, 16, 0.7), 0 0 18px rgba(255, 93, 93, 0.6);
+  pointer-events: none;
+}
+.drive-hud {
+  position: absolute;
+  left: 20px;
+  bottom: 20px;
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+  pointer-events: none;
+}
+.drive-hud .gauge {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: rgba(11, 13, 16, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 16px;
+  backdrop-filter: blur(6px);
+}
+.drive-hud .gauge .n { font-size: 30px; font-weight: 700; font-family: var(--mono); }
+.drive-hud .gauge .u { color: var(--muted); font-size: 12px; }
+.drive-stats { display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.drive-stats .blocked { color: var(--warn); }
+.drive-bar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(11, 13, 16, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 8px 7px 16px;
+  backdrop-filter: blur(8px);
+  font-size: 13px;
+}
+.drive-splash {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  padding: 24px;
+  background: rgba(11, 13, 16, 0.72);
+  backdrop-filter: blur(3px);
+  cursor: pointer;
+}
+.drive-splash h2 { margin: 0; font-size: 32px; letter-spacing: -0.8px; }
+.drive-splash p { margin: 0; max-width: 520px; color: var(--muted); }
+.drive-splash .keys { color: var(--faint); font-size: 13px; }

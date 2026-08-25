@@ -31,10 +31,47 @@ tick();
 `view.camera` and `view.scene` are the three objects, so OrbitControls and every
 other add-on attach normally.
 
-Instanced quads, NOT `Points`. three's WebGPU backend maps `object.isPoints` to
-`point-list` topology, and WGSL has no point-size builtin, so `sizeNode` is
-silently ignored there and every point rasterises as one pixel with no
-attenuation. Instanced quads are the only path to a sized splat.
+## Two rasterisers
+
+`sinkMode` picks how points reach the screen. The default is `"auto"`, which is
+the COMPUTE rasteriser wherever WebGPU gives us a device and the instanced one
+everywhere else. `view.rasterizer` reports which won, so a caller can see a
+fallback instead of inferring it from a frame time.
+
+```ts
+createPointCloudView({ canvas, sinkMode: "arena" }); // pin the instanced path
+```
+
+**Compute** software-rasterises in three passes — `atomicMin` the depth,
+`atomicAdd` the colour and a weight, then a fullscreen resolve that averages.
+One invocation per point: no instancing, no quad envelope, no per-instance
+attribute step.
+
+**Instanced** draws a view-aligned quad per point through three. NOT `Points`:
+three's WebGPU backend maps `object.isPoints` to `point-list` topology and WGSL
+has no point-size builtin, so `sizeNode` is silently ignored there and every
+point rasterises as one pixel with no attenuation.
+
+### Why compute is the default
+
+Measured on autzen at a 3M budget, same camera, same selected points, runs with
+a contaminated main thread discarded:
+
+| | INP | worst CPU frame |
+| --- | --- | --- |
+| instanced | 272–320 ms | 70.7 ms |
+| **compute** | **56–72 ms** | **9.5 ms** |
+| Potree 1.8, for scale | 136 ms | — |
+
+The cost the instanced path cannot shed is per INSTANCE — the attribute step for
+`pointOffset`, `color` and `scalarValue`, once per splat — and that was found by
+elimination rather than guessed: pinning the splat to 1 px left INP unchanged
+(so not fill rate), a 3-vertex envelope left it unchanged (so not per-vertex),
+and a sweep showed INP linear in instance count.
+
+Both paths share the LOD scheduler, the octree cut, the six colour modes, EDL
+and `pickPoint`, and both size a splat with the same numbers. What differs is
+what happens after the point is chosen.
 
 Colour modes: `rgb`, `elevation`, `level`, `intensity`, `classification`,
 `flat`. The two scalar modes select a different decode layout, so they are set

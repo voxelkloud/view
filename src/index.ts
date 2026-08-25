@@ -30,6 +30,8 @@ export type { PickPointOptions, PickResult } from "./pick.js";
 export { PerNodeSink } from "./sink.js";
 export type { PointReadback, PointSink } from "./sink.js";
 export { ArenaSink } from "./sink-arena.js";
+export { GroundIndex } from "./ground.js";
+export type { GroundIndexOptions, GroundNormal, GroundSample } from "./ground.js";
 export { PointArena } from "./arena.js";
 export { createReplaceScratch, filterReplacedParents } from "./replace.js";
 export type { ReplaceScratch, ReplaceTreeView } from "./replace.js";
