@@ -60,8 +60,10 @@ import type {
 import { createReplaceScratch, filterReplacedParents } from "./replace.js";
 import type { ReplaceScratch, ReplaceTreeView } from "./replace.js";
 import { ArenaSink } from "./sink-arena.js";
+import { buildTriangleBvh, trianglesFromObject } from "./deviation.js";
 import { OverlayRenderer } from "./overlay.js";
 import { ComputeRasterizer, ComputeSink, OVERLAY_DEPTH_FORMAT } from "./sink-compute.js";
+import { PointsRasterizer, PointsSink } from "./sink-points.js";
 import { PerNodeSink } from "./sink.js";
 import type { PointSink } from "./sink.js";
 
@@ -250,15 +252,38 @@ export interface PointCloudViewOptions {
    * the instanced path cannot shed is per INSTANCE, established by elimination
    * rather than guessed — see {@link ComputeSink}.
    *
-   * `"arena"` and `"per-node"` are the instanced paths and remain the fallback
-   * wherever compute is unavailable. Name one explicitly to pin it.
+   * `"auto"` resolves in order: COMPUTE on WebGPU, POINTS on WebGL 2, and the
+   * instanced arena only if neither is reachable. All three were measured on one
+   * host in one window, same camera and same selected points:
+   *
+   * | | INP | idle fps |
+   * | --- | --- | --- |
+   * | compute (WebGPU) | 72 ms | 59.9 |
+   * | points (WebGL 2) | 72 ms | 59.9 |
+   * | Potree 1.8, for scale | 88 ms | 59.9 |
+   * | instanced (WebGL 2) | 656 ms | 7.5 |
+   *
+   * `"arena"` and `"per-node"` are the instanced paths, and they are NOT
+   * obsolete — they are the only ones that draw through three's scene graph, so
+   * they are the only ones that compose with other three content: gizmos,
+   * meshes, overlays that need to occlude and be occluded. They are the
+   * COMPOSITION path now, not the performance one. Name one explicitly to pin
+   * it.
    */
-  readonly sinkMode?: "auto" | "arena" | "per-node" | "compute";
+  readonly sinkMode?: "auto" | "arena" | "per-node" | "compute" | "points";
   /**
    * Clear colour for the compute rasteriser, linear 0..1. Ignored by the
    * instanced paths, which clear through three.
    */
   readonly background?: readonly [number, number, number];
+  /**
+   * Use the WebGL 2 backend even where WebGPU is available.
+   *
+   * The fallback path, made reachable on purpose. Compute shaders are WebGPU
+   * only, so this also forces the instanced rasteriser regardless of
+   * {@link sinkMode} — `view.rasterizer` will say `"instanced"`.
+   */
+  readonly forceWebGL?: boolean;
   /**
    * Cancel an in-flight node fetch once the camera has moved past it and the
    * fetch queue is saturated. Default `true`.
@@ -339,6 +364,8 @@ interface CloudHandle {
   readonly sink: PointSink & { residentBytes: number; nodeCount: number };
   /** Set when this cloud draws through the compute rasteriser. */
   readonly computeSink: ComputeSink | undefined;
+  /** Set when this cloud draws through the WebGL 2 points rasteriser. */
+  readonly pointsSink: PointsSink | undefined;
   readonly reader: PointReader;
   readonly scratch: LodScratch;
   readonly selection: LodSelection;
@@ -490,22 +517,29 @@ export class PointCloudView {
   private readonly scratchInverse = new Matrix4();
   private readonly scratchVec = new Vector3();
   private readonly drawSize = new Vector2();
+  private readonly clipFromCloudM = new Matrix4();
+  private readonly viewFromCloudM = new Matrix4();
   /**
    * The screen-sized half of the compute path, shared by every cloud so they
    * accumulate into ONE depth buffer and therefore occlude each other. Created
    * after `init`, because it needs the device three opened.
    */
   private raster: ComputeRasterizer | undefined;
+  /** The WebGL 2 points path's frame-level half, and the context it draws with. */
+  private pointsRaster: PointsRasterizer | undefined;
+  private gl: WebGL2RenderingContext | undefined;
   private overlay: OverlayRenderer | undefined;
   /** What actually drew, after capability resolution. Public so a caller can
    *  see that a compute request fell back rather than guess from a frame time. */
-  rasterizer: "compute" | "instanced" = "instanced";
+  rasterizer: "compute" | "points" | "instanced" = "instanced";
   private depthRange: DepthRange = "minus-one-to-one";
   private frame = 0;
   private initialized = false;
   private disposed = false;
   private dirty = true;
   private edl: EdlPipeline | undefined;
+  /** Held so a cloud added after the cut still gets it. */
+  private clipPlanes: Float32Array | undefined;
 
   constructor(private readonly options: PointCloudViewOptions) {
     this.camera = new PerspectiveCamera(60, 1, 1, 20_000);
@@ -515,6 +549,9 @@ export class PointCloudView {
     this.renderer = new WebGPURenderer({
       canvas: options.canvas,
       antialias: false,
+      // Forcing the fallback is how it gets TESTED. A path that only runs on
+      // hardware nobody on the team has is a path nobody finds out is broken.
+      ...(options.forceWebGL === true ? { forceWebGL: true } : {}),
     });
     // NOT optional. Without it the model-view product is computed in float32 IN
     // THE SHADER, and cloud-relative positions come out WORSE than absolute
@@ -536,7 +573,14 @@ export class PointCloudView {
   /** Whether the caller asked for compute, explicitly or by taking the default. */
   private wantsCompute(): boolean {
     const mode = this.options.sinkMode ?? "auto";
-    return mode === "auto" || mode === "compute";
+    return (mode === "auto" || mode === "compute") && this.options.forceWebGL !== true;
+  }
+
+  /** Points is the WebGL 2 answer, so `"auto"` reaches it only where compute
+   *  did not — which `forceWebGL` also makes reachable on purpose. */
+  private wantsPoints(): boolean {
+    const mode = this.options.sinkMode ?? "auto";
+    return mode === "points" || (mode === "auto" && this.raster === undefined);
   }
 
   async init(): Promise<void> {
@@ -584,6 +628,27 @@ export class PointCloudView {
           },
         );
         this.rasterizer = "compute";
+      }
+    }
+    // POINTS, where compute did not reach. `backend.gl` is the WebGL 2 context
+    // three opened — the same seam as `backend.device` on the other side.
+    if (this.raster === undefined && this.wantsPoints()) {
+      const backend = (this.renderer as unknown as { backend?: { gl?: WebGL2RenderingContext } }).backend;
+      const gl = backend?.gl;
+      if (gl !== undefined && typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext) {
+        this.pointsRaster = new PointsRasterizer(gl, {
+          background: this.options.background ?? [0, 0, 0],
+          ...(this.options.edl !== undefined
+            ? {
+                edl: {
+                  strength: this.options.edl.strength ?? 1,
+                  radius: this.options.edl.radius ?? 1.4,
+                },
+              }
+            : {}),
+        });
+        this.gl = gl;
+        this.rasterizer = "points";
       }
     }
     this.initialized = true;
@@ -707,8 +772,33 @@ export class PointCloudView {
           scalarAttribute,
         )
       : undefined;
+    computeSink?.setClipPlanes(this.clipPlanes);
+    const pointsSink =
+      this.pointsRaster !== undefined && this.gl !== undefined
+        ? new PointsSink(
+            this.gl,
+            cut,
+            {
+              // CLOUD-LOCAL, the same frame `pointOffset` and the arena use.
+              min: [root0.minX - origin[0], root0.minY - origin[1], root0.minZ - origin[2]],
+              size: [root0.maxX - root0.minX, root0.maxY - root0.minY, root0.maxZ - root0.minZ],
+            },
+            {
+              pointBudget: this.lodOptions.pointBudget,
+              colorMode: resolved.colorMode,
+              sizeMultiplier: resolved.sizeMultiplier,
+              minPixelSize: resolved.minPixelSize,
+              maxPixelSize: resolved.maxPixelSize,
+              elevationRange: resolved.elevationRange,
+              scalarRange: resolved.scalarRange,
+              background: this.options.background ?? [0, 0, 0],
+            },
+            scalarAttribute,
+          )
+        : undefined;
     const sink =
       computeSink ??
+      pointsSink ??
       ((this.options.sinkMode ?? "auto") === "per-node"
         ? new PerNodeSink(object, material, scalarAttribute)
         : new ArenaSink(
@@ -761,6 +851,7 @@ export class PointCloudView {
       cut,
       sink,
       computeSink,
+      pointsSink,
       reader,
       scratch: createLodScratch(),
       selection: createLodSelection(this.lodOptions.maxNodes),
@@ -893,6 +984,104 @@ export class PointCloudView {
       options ?? {},
     );
     return index;
+  }
+
+  /**
+   * B5 — mede a nuvem contra esta malha.
+   *
+   * Constrói a BVH uma vez, entrega-a a cada nuvem e corre o kernel. O
+   * resultado entra no lugar do escalar, então desenhar o desvio é
+   * `setColorMode("scalar")` com a faixa que a tolerância pedir — a rampa, a
+   * legenda e o relatório já existem (DEC-B8).
+   *
+   * `maxDistance` corta a travessia cedo E limita a rampa: um telhado a 40 m do
+   * modelo não é um desvio, é outro prédio.
+   *
+   * Devolve quantos pontos foram medidos, ou 0 se não havia malha nem pontos.
+   */
+  setDeviationMesh(model: { updateMatrixWorld(force?: boolean): void; traverse(cb: (o: unknown) => void): void }, maxDistance = 5): number {
+    if (this.disposed) return 0;
+    const tris = trianglesFromObject(model as unknown as Parameters<typeof trianglesFromObject>[0]);
+    const bvh = buildTriangleBvh(tris);
+    let measured = 0;
+    for (const h of this.clouds) {
+      const e = h.object.matrixWorld.elements;
+      h.computeSink?.setDeviationMesh(bvh.nodes, bvh.tris, [e[12]!, e[13]!, e[14]!], maxDistance);
+      measured += h.computeSink?.runDeviation() ?? 0;
+    }
+    this.dirty = true;
+    return measured;
+  }
+
+  /** Remede depois de a nuvem ter carregado mais pontos. */
+  refreshDeviation(): number {
+    let n = 0;
+    for (const h of this.clouds) n += h.computeSink?.runDeviation() ?? 0;
+    this.dirty = true;
+    return n;
+  }
+
+  /**
+   * Cross-section planes, in SCENE coordinates: `[nx, ny, nz, d]` each, four at
+   * most. The positive half-space survives, which is three's convention.
+   *
+   * They cut the POINTS and the MODEL with one call, and that is the whole
+   * decision (DEC-B6): a section that slices the scan and leaves the wall
+   * standing is worse than no section, because it looks like an answer.
+   */
+  setClipPlanes(planes: Float32Array | undefined): void {
+    this.clipPlanes = planes;
+    this.overlay?.setClipPlanes(planes);
+    for (const h of this.clouds) h.computeSink?.setClipPlanes(planes);
+    this.dirty = true;
+  }
+
+  /**
+   * Which BIM elements are drawn: one entry per dense feature index, zero to
+   * hide. `undefined` shows everything. This is how isolating a storey or a
+   * class of element works — the geometry never moves.
+   */
+  setElementVisibility(mask: Uint32Array | undefined): void {
+    this.overlay?.setVisibility(mask);
+    this.dirty = true;
+  }
+
+  /**
+   * Highlight one BIM element, by the same dense index `pickElement` returns.
+   * `undefined` clears it. Takes effect on the next frame.
+   */
+  setSelectedElement(feature: number | undefined): void {
+    this.overlay?.setSelected(feature);
+    this.dirty = true;
+  }
+
+  /**
+   * Which BIM element is under the cursor, as the dense feature index the
+   * converter wrote. `undefined` when there is no model there — including when
+   * the point cloud is in front of it, which is deliberate: an element hidden
+   * behind the scan should not be selectable.
+   *
+   * Only answers on the compute path, because that is where the mesh is drawn
+   * and where the points' depth buffer exists to test against.
+   *
+   * Coordinates are CSS pixels, as an event gives them; the pixel ratio is
+   * applied here so a caller never has to remember it.
+   */
+  async pickElement(screenX: number, screenY: number): Promise<number | undefined> {
+    if (this.disposed) return undefined;
+    const depth = this.raster?.depth;
+    if (depth === undefined) return undefined;
+    const overlay = this.overlayFor();
+    if (overlay === undefined) return undefined;
+    const ratio = this.renderer.getPixelRatio();
+    return overlay.pickFeature(
+      this.camera,
+      depth,
+      this.drawSize.x,
+      this.drawSize.y,
+      screenX * ratio,
+      screenY * ratio,
+    );
   }
 
   /**
@@ -1180,6 +1369,22 @@ export class PointCloudView {
                 ),
         );
       }
+    }
+    // THE POINTS PATH, same shape as compute: clear once, every cloud draws into
+    // the shared depth buffer — which is what makes clouds occlude each other —
+    // then one resolve. EDL lives in that resolve.
+    else if (this.pointsRaster !== undefined) {
+      this.pointsRaster.begin(this.drawSize.x, this.drawSize.y);
+      for (const h of this.clouds) {
+        if (h.pointsSink === undefined) continue;
+        h.object.updateMatrixWorld();
+        this.clipFromCloudM
+          .multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
+          .multiply(h.object.matrixWorld);
+        this.viewFromCloudM.multiplyMatrices(this.camera.matrixWorldInverse, h.object.matrixWorld);
+        h.pointsSink.draw(this.camera, this.clipFromCloudM, this.viewFromCloudM, this.drawSize.y);
+      }
+      this.pointsRaster.end(this.camera, this.drawSize.x, this.drawSize.y);
     }
     // EDL owns the draw when it is on: it renders the scene into its own target
     // and composites, so calling `renderer.render` as well would draw the frame
@@ -1480,6 +1685,8 @@ export class PointCloudView {
   dispose(): void {
     this.raster?.dispose();
     this.raster = undefined;
+    this.pointsRaster?.dispose();
+    this.pointsRaster = undefined;
     this.overlay?.dispose();
     this.overlay = undefined;
     if (this.disposed) return;

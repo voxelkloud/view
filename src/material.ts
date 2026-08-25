@@ -55,7 +55,17 @@ export type ColorMode =
   /** Continuous ramp over the attribute's declared min/max. */
   | { readonly kind: "intensity" }
   /** Discrete palette, indexed by the ASPRS class code. */
-  | { readonly kind: "classification" };
+  | { readonly kind: "classification" }
+  /**
+   * B5 — distância à malha de projeto, em metros.
+   *
+   * Percorre a MESMA via escalar que `intensity`, e de propósito: a rampa, a
+   * faixa, a legenda e o relatório já a conhecem. A diferença é de onde vem o
+   * número — nenhum arquivo o traz, o kernel de `deviation-wgsl` escreve-o —
+   * e por isso `scalarAttributeFor` não pede atributo nenhum. Pedir um faria a
+   * nuvem ser recusada por não ter um campo que ela não devia ter.
+   */
+  | { readonly kind: "deviation" };
 
 /** The attribute a colour mode needs, or `undefined` for the built-in ones. */
 export function scalarAttributeFor(mode: ColorMode): string | undefined {
@@ -394,10 +404,17 @@ export function createPointMaterial(
     // Applied in BOTH rasterisers, and it has to be: they share this cut, so a
     // cap in one and not the other would make them size splats differently and
     // any A/B between them would be comparing two pictures, not two pipelines.
-    const shrink = depth
-      .sub(int(uNodeLevel))
-      .max(int(0))
-      .min(int(1))
+    //
+    // Clamped as a FLOAT, and that is not cosmetic. TSL emits the literals of
+    // `.max()`/`.min()` as floats whatever the node type, so an integer
+    // `vkShrink` produced `max(int, 0.0)` — which WGSL accepts and GLSL ES does
+    // not, since it has no such overload. The WebGL 2 fallback failed to
+    // compile its vertex shader and rendered nothing at all, silently, because
+    // nobody runs it: WebGPU is available on every machine here. `exp2` below
+    // wants a float anyway, so this also drops a cast.
+    const shrink = float(depth.sub(int(uNodeLevel)))
+      .max(0)
+      .min(1)
       .toVar('vkShrink');
 
     // A WORLD diameter, never a pixel size. A Potree level is a maximal
@@ -410,7 +427,7 @@ export function createPointMaterial(
     // any per-node or per-format pitch override in play — only the local shrink
     // is applied here.
     const dWorld = uNodeSpacing
-      .div(exp2(float(shrink)))
+      .div(exp2(shrink))
       .mul(2)
       .mul(uSizeMultiplier)
       .toVar('vkD0');

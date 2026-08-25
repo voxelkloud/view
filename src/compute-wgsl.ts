@@ -38,6 +38,12 @@ struct U {
   bgR       : f32,
   bgG       : f32,
   bgB       : f32,
+  // DEC-B6: os mesmos planos que cortam a malha, aqui já em coordenadas
+  // LOCAIS DA NUVEM. A conversão é uma soma — de cena para nuvem é uma
+  // translação, e para um plano isso é d += dot(n, t).
+  clipCount : f32,
+  _padC     : f32,
+  clip      : array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<storage, read>       pos   : array<f32>;
@@ -109,6 +115,12 @@ fn project(i : u32) -> Splat {
   var s : Splat;
   s.ok = false;
   let p = vec4<f32>(pos[i * 3u], pos[i * 3u + 1u], pos[i * 3u + 2u], 1.0);
+  // Antes da projeção: um ponto cortado fora não custa nem a multiplicação.
+  let nClip = u32(u.clipCount);
+  for (var ci : u32 = 0u; ci < nClip; ci = ci + 1u) {
+    let pl = u.clip[ci];
+    if (dot(pl.xyz, p.xyz) + pl.w < 0.0) { return s; }
+  }
   let c = u.clipFromCloud * p;
   if (c.w <= 0.0) { return s; }
   let ndc = c.xyz / c.w;

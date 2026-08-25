@@ -1,6 +1,7 @@
 import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Matrix4, PerspectiveCamera } from "three/webgpu";
 import { COMPUTE_WGSL } from "./compute-wgsl.js";
+import { DEVIATION_WGSL } from "./deviation-wgsl.js";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
 import type { PointReadback, PointSink } from "./sink.js";
@@ -14,6 +15,10 @@ const MODE_INDEX: Record<ColorMode["kind"], number> = {
   level: 3,
   intensity: 4,
   classification: 5,
+  // A mesma via escalar que `intensity`: o kernel do desvio escreve no `col`
+  // que o modo 4 lê. Um modo próprio, e não `intensity` reaproveitado, para
+  // que a UI e o relatório saibam que a unidade é metros de desvio.
+  deviation: 4,
 };
 
 export interface ComputeSinkOptions {
@@ -353,7 +358,13 @@ export class BlockAllocator {
 
 /** Point slots per u32 of `live`; the cap on distinct resident nodes. */
 const MAX_SLOTS = 65_536;
-const UNIFORM_BYTES = 192;
+// 256 e não 192 desde a DEC-B6: os quatro planos de corte precisam de
+// alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Manter
+// este número em sincronia com o `struct U` do WGSL é obrigatório — um uniform
+// mais curto que o struct dá layout inválido, e o cabeçalho de `compute-wgsl`
+// avisa que isso NÃO lança: os passes silenciam e a tela fica preta com todos
+// os contadores da CPU corretos.
+const UNIFORM_BYTES = 256;
 const WORKGROUP = 256;
 
 /**
@@ -386,6 +397,15 @@ const WORKGROUP = 256;
 export class ComputeSink implements PointSink {
   private readonly blocks = new Map<number, Block>();
   private readonly alloc: BlockAllocator;
+  private devNodes: GPUBuffer | undefined;
+  private devTris: GPUBuffer | undefined;
+  private devUniform: GPUBuffer | undefined;
+  private devPipeline: GPUComputePipeline | undefined;
+  private devLayout: GPUBindGroupLayout | undefined;
+  private devBind: GPUBindGroup | undefined;
+  private devBoundPos: GPUBuffer | undefined;
+  private devToScene: [number, number, number] = [0, 0, 0];
+  private devMaxDistance = 5;
   private capacity: number;
   private slotCount = 0;
 
@@ -406,6 +426,12 @@ export class ComputeSink implements PointSink {
   private readonly uniform = new ArrayBuffer(UNIFORM_BYTES);
   private readonly uf = new Float32Array(this.uniform);
   private readonly uu = new Uint32Array(this.uniform);
+  /**
+   * Cross-section planes in SCENE coordinates, `[nx, ny, nz, d]` each, four at
+   * most; the positive half-space survives. The SAME array the overlay gets, so
+   * a cut can never disagree between the points and the model (DEC-B6).
+   */
+  private clipPlanes: Float32Array | undefined;
 
   private bind: GPUBindGroup | undefined;
   private bindStale = true;
@@ -484,6 +510,115 @@ export class ComputeSink implements PointSink {
       size: Math.max(4, bytes),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
+  }
+
+  /**
+   * B5 — carrega a malha contra a qual medir, e mede.
+   *
+   * Um pipeline SÓ SEU. O de pontos já usa os oito storage buffers que o
+   * WebGPU garante por estágio; um nono não lança, faz o layout voltar
+   * inválido e todos os passes silenciarem. Este usa quatro.
+   *
+   * `toScene` é o deslocamento nuvem->cena: os pontos vivem em coordenadas
+   * locais da nuvem e a BVH em coordenadas de cena. Somar por ponto é mais
+   * barato que reconstruir a árvore.
+   *
+   * O RESULTADO SUBSTITUI A COR. O escalar mora no `col` (o shader de pontos lê
+   * `bitcast<f32>(col[i])` no modo 4), e é isso que faz o desvio herdar rampa,
+   * faixa e legenda sem UI nova — ao preço de a cor RGB daquele ponto deixar de
+   * existir até o nó ser reanexado.
+   */
+  setDeviationMesh(
+    nodes: Float32Array,
+    tris: Float32Array,
+    toScene: readonly [number, number, number],
+    maxDistance: number,
+  ): void {
+    if (this.disposed) return;
+    if (nodes.length === 0 || tris.length === 0) {
+      this.devNodes = undefined;
+      return;
+    }
+    this.devNodes?.destroy();
+    this.devTris?.destroy();
+    this.devNodes = this.storage(nodes.byteLength);
+    this.devTris = this.storage(tris.byteLength);
+    this.device.queue.writeBuffer(this.devNodes, 0, nodes as unknown as BufferSource);
+    this.device.queue.writeBuffer(this.devTris, 0, tris as unknown as BufferSource);
+
+    this.devUniform ??= this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.devToScene = [toScene[0], toScene[1], toScene[2]];
+    this.devMaxDistance = maxDistance;
+    this.devBind = undefined;
+  }
+
+  /**
+   * Corre o kernel sobre TODOS os pontos residentes.
+   *
+   * Sobre todos e não sobre os novos: acompanhar quais chegaram é contabilidade
+   * de alocador para poupar um passo que já é barato perto do frame, e um
+   * ponto que escapasse ficaria com a cor antiga no meio do mapa de desvio —
+   * um erro que se lê como dado.
+   */
+  runDeviation(): number {
+    if (this.disposed || this.devNodes === undefined || this.devTris === undefined) return 0;
+    const count = this.alloc.used;
+    if (count === 0) return 0;
+
+    if (this.devPipeline === undefined) {
+      const module = this.device.createShaderModule({ code: DEVIATION_WGSL });
+      this.devLayout = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        ],
+      });
+      this.devPipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.devLayout] }),
+        compute: { module, entryPoint: "main" },
+      });
+    }
+
+    // Rebind sempre que a arena cresce: `grow` TROCA os buffers, e um bind
+    // group guardado apontaria para os antigos — que ainda existem, ainda leem,
+    // e devolvem o desvio de outra cena.
+    if (this.devBind === undefined || this.devBoundPos !== this.posBuf) {
+      this.devBind = this.device.createBindGroup({
+        layout: this.devLayout!,
+        entries: [
+          { binding: 0, resource: { buffer: this.posBuf } },
+          { binding: 1, resource: { buffer: this.colBuf } },
+          { binding: 2, resource: { buffer: this.devNodes } },
+          { binding: 3, resource: { buffer: this.devTris } },
+          { binding: 4, resource: { buffer: this.devUniform! } },
+        ],
+      });
+      this.devBoundPos = this.posBuf;
+    }
+
+    const u = new ArrayBuffer(32);
+    new Uint32Array(u, 0, 1)[0] = count;
+    const f = new Float32Array(u);
+    f[1] = this.devToScene[0];
+    f[2] = this.devToScene[1];
+    f[3] = this.devToScene[2];
+    f[4] = this.devMaxDistance;
+    this.device.queue.writeBuffer(this.devUniform!, 0, u);
+
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.devPipeline);
+    pass.setBindGroup(0, this.devBind);
+    pass.dispatchWorkgroups(Math.ceil(count / 64));
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    return count;
   }
 
   get residentPoints(): number {
@@ -683,6 +818,10 @@ export class ComputeSink implements PointSink {
    * because the buffers hold CLOUD-LOCAL positions — the same frame the slab
    * arena stages, so both paths read one convention and neither rebases.
    */
+  setClipPlanes(planes: Float32Array | undefined): void {
+    this.clipPlanes = planes === undefined || planes.length === 0 ? undefined : planes;
+  }
+
   dispatch(
     enc: GPUCommandEncoder,
     camera: PerspectiveCamera,
@@ -729,6 +868,25 @@ export class ComputeSink implements PointSink {
     this.uf[38] = o.scalarRange[0];
     this.uf[39] = o.scalarRange[1];
     this.uf[40] = this.maxLevel;
+
+    // DEC-B6. De cena para local-da-nuvem é a translação do modelo, e para um
+    // plano covariante isso é só ajustar a distância: dot(n, p+t)+d >= 0 vira
+    // dot(n, p) + (d + dot(n, t)) >= 0. Sem rotação envolvida, sem transposta.
+    const planes = this.clipPlanes;
+    const nPlanes = planes === undefined ? 0 : Math.min(4, planes.length >> 2);
+    this.uf[46] = nPlanes;
+    const e = modelMatrix.elements;
+    for (let i = 0; i < nPlanes; i++) {
+      const nx = planes![i * 4]!;
+      const ny = planes![i * 4 + 1]!;
+      const nz = planes![i * 4 + 2]!;
+      const d = planes![i * 4 + 3]!;
+      const k = 48 + i * 4;
+      this.uf[k] = nx;
+      this.uf[k + 1] = ny;
+      this.uf[k + 2] = nz;
+      this.uf[k + 3] = d + nx * e[12]! + ny * e[13]! + nz * e[14]!;
+    }
     this.device.queue.writeBuffer(this.uniBuf, 0, this.uniform);
 
     const groups = Math.ceil(this.alloc.used / WORKGROUP);
@@ -743,6 +901,9 @@ export class ComputeSink implements PointSink {
 
 
   dispose(): void {
+    this.devNodes?.destroy();
+    this.devTris?.destroy();
+    this.devUniform?.destroy();
     if (this.disposed) return;
     this.disposed = true;
     for (const b of [

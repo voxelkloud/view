@@ -25,6 +25,20 @@ export { OctreeCut } from "./cut.js";
 export { BlockAllocator, ComputeRasterizer, ComputeSink } from "./sink-compute.js";
 export type { ComputeSinkOptions } from "./sink-compute.js";
 export { PointCloudObject3D } from "./object.js";
+export { loadModelLayer } from "./model.js";
+export {
+  BVH_NODE_STRIDE,
+  BVH_TRI_STRIDE,
+  buildTriangleBvh,
+  distanceToBvh,
+  pointBoxDistanceSq,
+  pointTriangleDistanceSq,
+  trianglesFromObject,
+} from "./deviation.js";
+export type { TriangleBvh } from "./deviation.js";
+export type { ModelLayer } from "./model.js";
+export { MESH_LOC, quantisedMeshLayout } from "./mesh-layout.js";
+export type { MeshVertexLayout } from "./mesh-layout.js";
 export { pickPoint } from "./pick.js";
 export type { PickPointOptions, PickResult } from "./pick.js";
 export { PerNodeSink } from "./sink.js";
