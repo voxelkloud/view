@@ -1,9 +1,10 @@
 import type { DecodedPointData } from "@voxelkloud/format-potree";
-import type { Matrix4, PerspectiveCamera } from "three/webgpu";
+import type { Matrix4, PerspectiveCamera } from "three";
 import { COMPUTE_WGSL } from "./compute-wgsl.js";
 import { DEVIATION_WGSL } from "./deviation-wgsl.js";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
+import { CLASS_ATTRIBUTE } from "./material-options.js";
 import type { PointReadback, PointSink } from "./sink.js";
 import { toZeroToOneDepth } from "./clip.js";
 
@@ -356,8 +357,14 @@ export class BlockAllocator {
   }
 }
 
-/** Point slots per u32 of `live`; the cap on distinct resident nodes. */
-const MAX_SLOTS = 65_536;
+/**
+ * Point slots per u32 of `live`; the cap on distinct resident nodes.
+ *
+ * Exportado porque {@link packNodeMeta} lhe reserva EXACTAMENTE 16 bits: subir
+ * isto acima de 65536 faz dois nós partilharem slot e consultarem a liveness um
+ * do outro, sem erro nenhum. Um teste tranca a invariante.
+ */
+export const MAX_SLOTS = 65_536;
 // 256 e não 192 desde a DEC-B6: os quatro planos de corte precisam de
 // alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Manter
 // este número em sincronia com o `struct U` do WGSL é obrigatório — um uniform
@@ -366,6 +373,48 @@ const MAX_SLOTS = 65_536;
 // os contadores da CPU corretos.
 const UNIFORM_BYTES = 256;
 const WORKGROUP = 256;
+
+/**
+ * `nmeta`, um u32 por ponto: nível nos 8 bits baixos, slot do nó dono nos 16
+ * seguintes, classe ASPRS no byte de topo.
+ *
+ * O byte de topo estava livre porque {@link MAX_SLOTS} é 65536: o slot nunca
+ * passa de 16 bits ainda que o layout lhe reservasse 24. É o que torna a classe
+ * gratuita — sem buffer novo, num layout de bind que já está no limite de oito
+ * storage buffers que o WebGPU garante por estágio, e onde um nono não lançaria
+ * erro, faria os passes silenciarem.
+ *
+ * O shader tem de ler o slot com máscara (`slotOf`), nunca com um `>> 8` cru:
+ * sem ela a classe entra no índice e o ponto consulta a liveness de outro nó.
+ *
+ * @param present marcado por código visto, para a UI listar só o que existe.
+ * Escrito aqui porque este laço já toca todo ponto, e uma segunda passada por
+ * 20 milhões de pontos para contar o mesmo seria pura repetição.
+ */
+export function packNodeMeta(
+  level: number,
+  slot: number,
+  count: number,
+  classes: ArrayLike<number> | undefined,
+  present?: Uint8Array,
+): Uint32Array {
+  const base = (level & 0xff) | ((slot & 0xffff) << 8);
+  const meta = new Uint32Array(count);
+  if (classes === undefined) {
+    meta.fill(base);
+    return meta;
+  }
+  for (let i = 0; i < count; i++) {
+    // A lane f32 carrega o código cru. Um valor fora de 0..255 não é uma classe
+    // ASPRS; cai em 255, que o shader já trata como "fora do padrão" junto com
+    // tudo acima de 18 — e não em 0, que é uma classe real ("created").
+    const raw = classes[i] ?? 0;
+    const code = raw >= 0 && raw <= 255 ? raw | 0 : 255;
+    if (present !== undefined) present[code] = 1;
+    meta[i] = base | (code << 24);
+  }
+  return meta;
+}
 
 /**
  * A {@link PointSink} that also DRAWS, by software-rasterising its points in
@@ -444,6 +493,17 @@ export class ComputeSink implements PointSink {
   private readonly mode: number;
   private cutDepth = 1;
   private maxLevel = 1;
+  /** Bitmask das classes escondidas, lido pelo shader em qualquer modo. */
+  private classHidden = 0;
+  /**
+   * Que códigos ASPRS esta nuvem realmente contém, um flag por código.
+   *
+   * Acumulado no `attach`, que já percorre todo ponto para empacotar a classe,
+   * porque a alternativa é a UI listar as 20 classes do padrão numa nuvem que
+   * tem quatro. Só cresce: um nó descarregado não retira o que já se viu, e
+   * isso é o que se quer — a lista da UI não deve piscar com o streaming.
+   */
+  private readonly classPresent = new Uint8Array(256);
   private disposed = false;
 
   constructor(
@@ -463,7 +523,15 @@ export class ComputeSink implements PointSink {
     // refused instead would draw less than the budget while every counter said
     // otherwise. That failure mode is not hypothetical — it is how the first
     // streaming build of this measured itself void.
-    this.capacity = Math.max(1 << 16, Math.ceil(options.pointBudget * 1.25));
+    //
+    // Capped at what the DEVICE can bind: posBuf is the widest lane at 12
+    // bytes/point, and a bind group over the limit fails validation and every
+    // pass after it goes invalid — the sink would render nothing at all, which
+    // is strictly worse than rendering the capped budget.
+    this.capacity = Math.min(
+      this.maxBindablePoints(),
+      Math.max(1 << 16, Math.ceil(options.pointBudget * 1.25)),
+    );
     this.alloc = new BlockAllocator(this.capacity);
     this.posBuf = this.storage(this.capacity * 12);
     this.colBuf = this.storage(this.capacity * 4);
@@ -503,6 +571,11 @@ export class ComputeSink implements PointSink {
       device.createComputePipeline({ layout: pl, compute: { module: raster.module, entryPoint } });
     this.depthPipe = compute("depthPass");
     this.colorPipe = compute("colorPass");
+  }
+
+  /** The largest point count whose position buffer still binds as storage. */
+  private maxBindablePoints(): number {
+    return Math.floor(this.device.limits.maxStorageBufferBindingSize / 12);
   }
 
   private storage(bytes: number): GPUBuffer {
@@ -602,13 +675,15 @@ export class ComputeSink implements PointSink {
       this.devBoundPos = this.posBuf;
     }
 
+    // Espelha `struct U` de deviation-wgsl BYTE A BYTE. Ver o comentário lá
+    // sobre por que o vec3 vem primeiro.
     const u = new ArrayBuffer(32);
-    new Uint32Array(u, 0, 1)[0] = count;
     const f = new Float32Array(u);
-    f[1] = this.devToScene[0];
-    f[2] = this.devToScene[1];
-    f[3] = this.devToScene[2];
-    f[4] = this.devMaxDistance;
+    f[0] = this.devToScene[0];
+    f[1] = this.devToScene[1];
+    f[2] = this.devToScene[2];
+    f[3] = this.devMaxDistance;
+    new Uint32Array(u, 16, 1)[0] = count;
     this.device.queue.writeBuffer(this.devUniform!, 0, u);
 
     const enc = this.device.createCommandEncoder();
@@ -619,6 +694,46 @@ export class ComputeSink implements PointSink {
     pass.end();
     this.device.queue.submit([enc.finish()]);
     return count;
+  }
+
+  /**
+   * Lê de volta da GPU uma amostra de posições e desvios, para conferir o
+   * kernel contra a referência em CPU (`distanceToBvh`).
+   *
+   * Existe porque `readPoints` devolve a cópia que a CPU subiu, e o kernel do
+   * desvio só escreve na GPU: comparar contra ela compararia o dado com ele
+   * mesmo. As posições saem em coordenadas LOCAIS DA NUVEM, que é como estão
+   * no buffer — quem compara soma o mesmo `toScene` que o kernel somou.
+   */
+  async readDeviationSample(
+    n: number,
+  ): Promise<{ positions: Float32Array; deviations: Float32Array } | undefined> {
+    if (this.disposed) return undefined;
+    const count = Math.min(n, this.alloc.used);
+    if (count === 0) return undefined;
+
+    const posBytes = count * 12;
+    const colBytes = count * 4;
+    const rb = this.device.createBuffer({
+      size: posBytes + colBytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.posBuf, 0, rb, 0, posBytes);
+    enc.copyBufferToBuffer(this.colBuf, 0, rb, posBytes, colBytes);
+    this.device.queue.submit([enc.finish()]);
+
+    await rb.mapAsync(GPUMapMode.READ);
+    const positions = new Float32Array(rb.getMappedRange(0, posBytes).slice(0));
+    const deviations = new Float32Array(rb.getMappedRange(posBytes, colBytes).slice(0));
+    rb.unmap();
+    rb.destroy();
+    return { positions, deviations };
+  }
+
+  /** O offset que o kernel usou, para a verificação comparar com o mesmo. */
+  get deviationToScene(): readonly [number, number, number] {
+    return this.devToScene;
   }
 
   get residentPoints(): number {
@@ -641,8 +756,13 @@ export class ComputeSink implements PointSink {
   }
 
   private grow(need: number): void {
+    // Same ceiling as the constructor: past it the bind group fails validation,
+    // so growth stops there and `attach` refuses the node instead.
+    const max = this.maxBindablePoints();
+    if (this.capacity >= max) return;
     let cap = this.capacity;
-    while (cap < need) cap *= 2;
+    while (cap < need && cap < max) cap *= 2;
+    cap = Math.min(cap, max);
     const copy = (old: GPUBuffer, stride: number): GPUBuffer => {
       const next = this.storage(cap * stride);
       const enc = this.device.createCommandEncoder();
@@ -718,7 +838,13 @@ export class ComputeSink implements PointSink {
       if (colors !== undefined) {
         // RGBA bytes ARE the u32 the shader reads, on a little-endian host:
         // byte 0 lands in the low 8 bits, which is where `shade` looks for red.
-        // So this uploads with no per-point conversion at all.
+        //
+        // O byte de topo é forçado a 255 porque ele deixou de ser ignorado: o
+        // kernel do desvio carimba ali a distância à malha, e o corte esconde
+        // o que estiver ABAIXO do limiar. Um ponto acabado de chegar ainda não
+        // foi carimbado, e tem de nascer "longe" — nascer com o alfa da origem
+        // faria a nuvem piscar buracos onde o streaming ainda não passou, com
+        // o alfa 128 do cinza de fallback a esconder metade do levantamento.
         q.writeBuffer(this.colBuf, start * 4, gpuData(colors), 0, n * 4);
         this.colCpu.set(colors.subarray(0, n * 4), start * 4);
         staged += colors.byteLength;
@@ -733,7 +859,12 @@ export class ComputeSink implements PointSink {
 
     const pitch = new Float32Array(n).fill(spacingWorld);
     q.writeBuffer(this.pitchBuf, start * 4, gpuData(pitch));
-    const meta = new Uint32Array(n).fill((level & 0xff) | (slot << 8));
+
+    // A classe é lida à parte do escalar de propósito: no modo classificação os
+    // dois são o mesmo atributo, mas em RGB ou intensidade o escalar é outro —
+    // ou nenhum — e esconder uma classe tem de valer em todos.
+    const classes = data.attributesByName.get(CLASS_ATTRIBUTE)?.array;
+    const meta = packNodeMeta(level, slot, n, classes, this.classPresent);
     q.writeBuffer(this.metaBuf, start * 4, gpuData(meta));
     if (level > this.maxLevel) this.maxLevel = level;
     return staged;
@@ -822,6 +953,25 @@ export class ComputeSink implements PointSink {
     this.clipPlanes = planes === undefined || planes.length === 0 ? undefined : planes;
   }
 
+  /** Ver {@link PointCloudView.setHiddenClasses} — aqui é só o uniform. */
+  setClassHidden(mask: number): void {
+    this.classHidden = mask >>> 0;
+  }
+
+  /**
+   * Os códigos ASPRS vistos até agora, crescente e sem repetição.
+   *
+   * Vazio numa nuvem sem classificação — que é diferente de "ainda não chegou
+   * nó nenhum", e a UI tem de tratar os dois casos igual: não listar nada.
+   */
+  get presentClasses(): readonly number[] {
+    const out: number[] = [];
+    for (let code = 0; code < 256; code++) {
+      if (this.classPresent[code] === 1) out.push(code);
+    }
+    return out;
+  }
+
   dispatch(
     enc: GPUCommandEncoder,
     camera: PerspectiveCamera,
@@ -875,6 +1025,9 @@ export class ComputeSink implements PointSink {
     const planes = this.clipPlanes;
     const nPlanes = planes === undefined ? 0 : Math.min(4, planes.length >> 2);
     this.uf[46] = nPlanes;
+    // O slot 47 era o padding antes de 'clip'; agora carrega a máscara de
+    // classes escondidas (u32), e o array continua alinhado a 16 bytes.
+    this.uu[47] = this.classHidden;
     const e = modelMatrix.elements;
     for (let i = 0; i < nPlanes; i++) {
       const nx = planes![i * 4]!;

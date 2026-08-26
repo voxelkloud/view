@@ -19,7 +19,7 @@
 // uint16 are followed by two spare bytes, so `uint16x4` reads them in one go
 // and the shader drops `.w`. Same for the normal's `snorm8x4`.
 
-import type { BufferGeometry, InterleavedBufferAttribute } from "three/webgpu";
+import type { BufferGeometry, InterleavedBufferAttribute } from "three";
 
 /** Where the shader expects each attribute. Mirrored in the WGSL. */
 export const MESH_LOC = { position: 0, normal: 1, featureId: 2 } as const;

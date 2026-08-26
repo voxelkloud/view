@@ -1,5 +1,5 @@
-import { Matrix3 } from "three/webgpu";
-import type { Camera, Object3D } from "three/webgpu";
+import { Matrix3 } from "three";
+import type { Camera, Object3D } from "three";
 import type { MeshVertexLayout } from "./mesh-layout.js";
 import { quantisedMeshLayout } from "./mesh-layout.js";
 
@@ -59,7 +59,11 @@ struct U {
   screenW    : f32,
   screenH    : f32,
   hasTexture : f32,
-  _pad       : f32,
+  // Raio-x: 1 desliga o teste contra a profundidade da nuvem, e o modelo passa
+  // a desenhar POR CIMA do scan em vez de ser ocultado por ele. É o modo que
+  // todo visualizador AEC tem, e aqui é um flag porque a oclusão é nossa —
+  // ninguém precisa de um segundo passe nem de mexer na ordem de desenho.
+  xray       : f32,
   normalMat  : mat4x4<f32>,
   selected   : f32,
   clipCount  : f32,
@@ -119,7 +123,10 @@ fn fs(in : VSOut) -> @location(0) u32 {
   }
   let x = u32(clamp(in.pos.x, 0.0, u.screenW - 1.0));
   let y = u32(clamp(in.pos.y, 0.0, u.screenH - 1.0));
-  if (bitcast<u32>(in.eyeDepth) > pointDepth[y * u32(u.screenW) + x]) {
+  // Em raio-x o elemento também fica CLICÁVEL: se se vê, seleciona-se. Deixar
+  // este teste ligado aqui daria um modo em que se olha para uma parede e o
+  // clique atravessa para o que está atrás.
+  if (u.xray < 0.5 && bitcast<u32>(in.eyeDepth) > pointDepth[y * u32(u.screenW) + x]) {
     discard;
   }
   return in.featureId;
@@ -133,7 +140,11 @@ struct U {
   screenW    : f32,
   screenH    : f32,
   hasTexture : f32,
-  _pad       : f32,
+  // Raio-x: 1 desliga o teste contra a profundidade da nuvem, e o modelo passa
+  // a desenhar POR CIMA do scan em vez de ser ocultado por ele. É o modo que
+  // todo visualizador AEC tem, e aqui é um flag porque a oclusão é nossa —
+  // ninguém precisa de um segundo passe nem de mexer na ordem de desenho.
+  xray       : f32,
   normalMat  : mat4x4<f32>,
   // Qual elemento está selecionado, ou -1. Um uniform e não um atributo: a
   // seleção muda a cada clique e a geometria não muda nunca, e reenviar um
@@ -203,7 +214,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let x = u32(clamp(in.pos.x, 0.0, u.screenW - 1.0));
   let y = u32(clamp(in.pos.y, 0.0, u.screenH - 1.0));
   let stored = pointDepth[y * u32(u.screenW) + x];
-  if (bitcast<u32>(in.eyeDepth) > stored) {
+  if (u.xray < 0.5 && bitcast<u32>(in.eyeDepth) > stored) {
     discard;
   }
   // Two lights and an ambient floor, no shadows: enough for a wall to read as a
@@ -364,6 +375,7 @@ export class OverlayRenderer {
   /** Planos em coordenadas de CENA, 4 no máximo. `undefined` = sem corte. */
   private clip: Float32Array | undefined;
   private visible: GPUBuffer | undefined;
+  private xray = false;
   private boundVisibility: GPUBuffer | undefined;
   private emptyVisible: GPUBuffer | undefined;
   private layout: GPUBindGroupLayout | undefined;
@@ -710,6 +722,7 @@ export class OverlayRenderer {
       this.scratch[20] = width;
       this.scratch[21] = height;
       this.scratch[22] = draw.image !== undefined ? 1 : 0;
+      this.scratch[23] = this.xray ? 1 : 0;
       if (draw.normalMatrix !== undefined) this.scratch.set(draw.normalMatrix, 24);
       this.scratch[40] = this.selected;
       const planes = this.clip;
@@ -934,6 +947,11 @@ export class OverlayRenderer {
   }
 
   /** Highlight one element, or `undefined` to clear. Costs one float per draw. */
+  /** Raio-x: desenhar o modelo por cima da nuvem em vez de ser ocultado. */
+  setXray(on: boolean): void {
+    this.xray = on;
+  }
+
   setSelected(feature: number | undefined): void {
     this.selected = feature ?? -1;
   }

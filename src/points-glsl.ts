@@ -16,10 +16,12 @@ precision highp float;
 in vec3 aPos;
 in vec4 aColor;
 in float aPitch;
-// LEVEL and SLOT in one attribute: 'slot * 32 + level'. Both are small
-// integers and float32 is exact to 2^24, so this costs no precision and saves
-// an attribute — which matters at three million vertices.
-in float aMeta;
+// LEVEL, SLOT and CLASS in one attribute, the same layout the compute arm
+// packs — see 'packNodeMeta'. Bound as an INTEGER, not a float: the three
+// together need 29 bits and float32 is only exact to 2^24, so the class byte
+// would have silently rounded into the slot. As an integer the same 4 bytes
+// carry all three, and no attribute is added at three million vertices.
+in uint aMeta;
 
 uniform mat4 uClipFromCloud;
 uniform mat4 uViewFromCloud;
@@ -39,6 +41,9 @@ uniform vec3 uFlatColor;
 uniform vec2 uElevRange;
 uniform vec2 uScalarRange;
 uniform float uMaxLevel;
+// Bitmask das classes ESCONDIDAS: bit n esconde o código n para 0..18, bit 31
+// esconde o balde "fora do padrão". Zero não esconde nada, que é o default.
+uniform uint uClassHidden;
 
 // The same five stops the instanced material ramps through, and the same ASPRS
 // palette, as constants rather than a texture: 5 and 19 entries of compile-time
@@ -78,14 +83,23 @@ out vec4 vColor;
 flat out uint vId;
 
 void main() {
-  float aLevel = mod(aMeta, 32.0);
-  int slotId = int((aMeta - aLevel) / 32.0);
+  float aLevel = float(aMeta & 0xffu);
+  int slotId = int((aMeta >> 8u) & 0xffffu);
+  uint aClass = aMeta >> 24u;
 
   // Rejected BEFORE any projection work. A point whose node the scheduler did
   // not pick this frame is pushed outside clip space, which is the cheapest
   // cull available in a vertex shader — 'discard' would still pay for the
   // fragment.
-  if (uUseMask == 1 && texelFetch(uLive, ivec2(slotId & 1023, slotId >> 10), 0).r == 0u) {
+  //
+  // A hidden CLASS leaves by the same door, and in every colour mode: the code
+  // rides in 'aMeta' rather than in 'aColor', which means whatever the live
+  // mode needs. Culling here and not in the fragment stage also means the point
+  // writes no depth, so a hidden class stops occluding what is behind it.
+  bool classOff = uClassHidden != 0u
+    && (uClassHidden >> (aClass <= 18u ? aClass : 31u) & 1u) == 1u;
+  if (classOff
+      || (uUseMask == 1 && texelFetch(uLive, ivec2(slotId & 1023, slotId >> 10), 0).r == 0u)) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     gl_PointSize = 0.0;
     vColor = vec4(0.0);
@@ -112,7 +126,9 @@ void main() {
     float v = aColor.r * 255.0 + aColor.g * 255.0 * 256.0;
     rgb = rampAt((v - uScalarRange.x) / max(uScalarRange.y - uScalarRange.x, 1e-9));
   } else if (uMode == 5) {
-    rgb = classColor(int(aColor.r * 255.0 + 0.5));
+    // Do 'aMeta', não do 'aColor': a classe está lá em todos os modos agora, e
+    // ler do mesmo sítio que o filtro garante que a cor e o olho nunca discordem.
+    rgb = classColor(int(aClass));
   } else {
     rgb = aColor.rgb;
   }
@@ -188,6 +204,17 @@ void main() {
   // A round splat, not the square gl.POINTS gives for free. Potree offers both;
   // the disc is what our instanced material draws, so this keeps the two
   // rasterisers comparable rather than flattering this one.
+  // A HARD disc, and the soft rim that replaced it for one commit is why.
+  //
+  // Fading alpha at the rim needs blending, and blending an opaque surface is
+  // order-dependent: with depth writes on, a splat's rim mixes with whatever is
+  // already there, which is the BACKGROUND — so every point gained a dark halo
+  // and the surface fell apart into beads. It cost nothing in INP and ruined the
+  // picture, which is worse than costing time.
+  //
+  // The technique that would work is alpha-to-coverage against a multisampled
+  // target: order-independent, depth-correct, and paying real fill and memory
+  // for the MSAA. That is a measurement to make, not a line to change.
   vec2 d = gl_PointCoord - vec2(0.5);
   if (uRound == 1 && dot(d, d) > 0.25) discard;
   outColor = vColor;

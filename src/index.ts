@@ -6,19 +6,24 @@
 export * from "./lod/index.js";
 export * from "./profile/index.js";
 
-export {
-  createPointMaterial,
-  resolvePointMaterialOptions,
-  scalarAttributeFor,
-} from "./material.js";
+// The option helpers come from `material-options.js`, whose module graph is
+// plain arithmetic. `createPointMaterial` and `createEdlPipeline` do NOT: both
+// build on `three/webgpu`, three's WebGPU build, which is 357 kB gzipped
+// against 115 kB for the core. Re-exported here as VALUES they put a static
+// edge from this entry point into that build, and every consumer downloaded it
+// — including the ones rendering through raw WebGL 2, which is most of them.
+// `sideEffects: false` did not save them: three itself makes no such promise,
+// so the bundler kept the whole graph.
+//
+// They live on subpaths now: `@voxelkloud/view/material` and
+// `@voxelkloud/view/edl`. Types stay here, because types cost nothing.
+export { resolvePointMaterialOptions, scalarAttributeFor } from "./material-options.js";
 export type {
   ColorMode,
-  PointCloudMaterial,
   PointMaterialOptions,
   ResolvedPointMaterialOptions,
-} from "./material.js";
-
-export { createEdlPipeline, resolveEdlOptions } from "./edl.js";
+} from "./material-options.js";
+export type { PointCloudMaterial } from "./material.js";
 export type { EdlOptions, EdlPipeline, ResolvedEdlOptions } from "./edl.js";
 
 export { OctreeCut } from "./cut.js";
@@ -30,12 +35,16 @@ export {
   BVH_NODE_STRIDE,
   BVH_TRI_STRIDE,
   buildTriangleBvh,
+  clusterDeviation,
+  nearestOnBvh,
+  raycastBvh,
+  solveAlignment,
   distanceToBvh,
   pointBoxDistanceSq,
   pointTriangleDistanceSq,
   trianglesFromObject,
 } from "./deviation.js";
-export type { TriangleBvh } from "./deviation.js";
+export type { Alignment, DeviationCluster, TriangleBvh } from "./deviation.js";
 export type { ModelLayer } from "./model.js";
 export { MESH_LOC, quantisedMeshLayout } from "./mesh-layout.js";
 export type { MeshVertexLayout } from "./mesh-layout.js";
@@ -57,7 +66,13 @@ export {
   createPointCloudView,
   scalarRangeFor,
 } from "./view.js";
-export type { PointCloudViewOptions, ViewProfileOptions, ViewStats } from "./view.js";
+export type {
+  ClipTarget,
+  DeviceLostInfo,
+  PointCloudViewOptions,
+  ViewProfileOptions,
+  ViewStats,
+} from "./view.js";
 
 /** `true` when this environment can create a WebGPU device. Safe in Node. */
 export function isWebGPUAvailable(): boolean {

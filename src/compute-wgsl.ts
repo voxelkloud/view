@@ -42,7 +42,10 @@ struct U {
   // LOCAIS DA NUVEM. A conversão é uma soma — de cena para nuvem é uma
   // translação, e para um plano isso é d += dot(n, t).
   clipCount : f32,
-  _padC     : f32,
+  // Bitmask das classes ESCONDIDAS, em qualquer modo de cor: bit n esconde o
+  // código n para 0..18, bit 31 esconde o balde "fora do padrão". Vive no
+  // que era o padding antes de 'clip', então o layout não mexe.
+  classHidden : u32,
   clip      : array<vec4<f32>, 4>,
 };
 
@@ -52,7 +55,10 @@ struct U {
 @group(0) @binding(3) var<storage, read_write> accum : array<atomic<u32>>;
 @group(0) @binding(4) var<uniform>             u     : U;
 @group(0) @binding(5) var<storage, read>       pitch : array<f32>;
-// Level in the low 8 bits, owning node slot in the high 24.
+// Level in the low 8 bits, owning node slot in the next 16, ASPRS class in the
+// top 8. The slot only ever needs 16 because MAX_SLOTS is 65536, so the class
+// rides in bits that were already allocated and cost nothing — which is the
+// only reason it can be here at all, with the eight-buffer limit above.
 @group(0) @binding(6) var<storage, read>       nmeta : array<u32>;
 // Per cut slot: child mask in the low 8 bits, first-child slot in the high 24,
 // the same bytes 'OctreeCut' feeds the instanced material's DataTexture.
@@ -79,6 +85,25 @@ const CLASSES = array<vec3<f32>, 19>(
   vec3<f32>(0.80, 0.50, 0.60), vec3<f32>(0.95, 0.85, 0.40), vec3<f32>(0.60, 0.55, 0.70),
   vec3<f32>(1.00, 0.10, 0.55));
 const UNKNOWN_CLASS = vec3<f32>(0.0, 0.85, 0.8);
+
+// O SLOT do nó dono, em 16 bits. O byte de topo do 'nmeta' carrega a classe, e
+// um '>> 8u' cru traria a classe junto e indexaria 'live' fora do nó certo.
+fn slotOf(i : u32) -> u32 {
+  return (nmeta[i] >> 8u) & 0xffffu;
+}
+
+// A classe deste ponto está desligada? Vale em TODOS os modos de cor: o código
+// viaja no byte de topo do 'nmeta', não no 'col' que muda de significado com o
+// modo, então esconder uma classe e depois trocar para RGB mantém-na escondida.
+// Ambos os passes chamam isto: um ponto escondido que ainda escrevesse
+// profundidade seguiria ocluindo o que está atrás dele — invisível, mas
+// presente, que é pior que um bug visível.
+fn classOff(i : u32) -> bool {
+  if (u.classHidden == 0u) { return false; }
+  let code = nmeta[i] >> 24u;
+  let bit = select(31u, code, code <= 18u);
+  return ((u.classHidden >> bit) & 1u) == 1u;
+}
 
 // Screen pixel for point i, or ok=false when it is off screen or behind the eye.
 //
@@ -244,7 +269,8 @@ fn clearPass(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u.count) { return; }
-  if (live[nmeta[i] >> 8u] == 0u) { return; }
+  if (live[slotOf(i)] == 0u) { return; }
+  if (classOff(i)) { return; }
   let s = project(i);
   if (!s.ok) { return; }
   let ri = i32(ceil(s.r - 0.5));
@@ -267,7 +293,8 @@ fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u.count) { return; }
-  if (live[nmeta[i] >> 8u] == 0u) { return; }
+  if (live[slotOf(i)] == 0u) { return; }
+  if (classOff(i)) { return; }
   let s = project(i);
   if (!s.ok) { return; }
   let rgb = shade(i, pos[i * 3u + 2u]) * 255.0;

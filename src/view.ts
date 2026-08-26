@@ -14,20 +14,31 @@ import type {
   PointReaderFactory,
 } from "@voxelkloud/core";
 import {
+  Color,
   Matrix4,
   PerspectiveCamera,
   Scene,
   Vector2,
   Vector3,
-  WebGPURenderer,
-} from "three/webgpu";
+} from "three";
+// TYPE only, and that is the whole point: `three/webgpu` is three's WebGPU
+// build — 357 kB gzipped against 115 kB for the core — and it reaches the
+// bundle through any VALUE import. Compute and points never render through it
+// (both draw straight to the swapchain; see overlay.ts), so it is loaded on
+// demand, in the one branch that needs it.
+import type { WebGPURenderer } from "three/webgpu";
 import { OctreeCut } from "./cut.js";
+// The NUMBERS half, statically: every rasteriser sizes splats from these.
 import {
-  createPointMaterial,
+  CLASS_ATTRIBUTE,
   resolvePointMaterialOptions,
   scalarAttributeFor,
-} from "./material.js";
-import type { PointCloudMaterial, PointMaterialOptions } from "./material.js";
+} from "./material-options.js";
+import type { PointMaterialOptions } from "./material-options.js";
+// The MATERIAL half is a type here and a dynamic import in `init`. It builds a
+// `NodeMaterial` out of TSL, so importing it for its value is what pulled the
+// whole WebGPU build into bundles that only ever drew through raw WebGL 2.
+import type { PointCloudMaterial, createPointMaterial } from "./material.js";
 import { extractFrustumPlanes } from "./lod/frustum.js";
 import type { DepthRange } from "./lod/frustum.js";
 import { suggestNearFar } from "./lod/metric.js";
@@ -45,7 +56,10 @@ import type {
   LodSelection,
   ResolvedLodOptions,
 } from "./lod/select.js";
-import { createEdlPipeline } from "./edl.js";
+// `createEdlPipeline` is imported dynamically where it is used. Statically it
+// would drag `PostProcessing` — and with it the whole WebGPU build — into every
+// bundle, including the WebGL-only ones that have their own EDL in the
+// rasteriser.
 import type { EdlOptions, EdlPipeline } from "./edl.js";
 import { PointCloudObject3D } from "./object.js";
 import { pickPoint as pickPointOnClouds } from "./pick.js";
@@ -60,7 +74,14 @@ import type {
 import { createReplaceScratch, filterReplacedParents } from "./replace.js";
 import type { ReplaceScratch, ReplaceTreeView } from "./replace.js";
 import { ArenaSink } from "./sink-arena.js";
-import { buildTriangleBvh, trianglesFromObject } from "./deviation.js";
+import {
+  buildTriangleBvh,
+  clusterDeviation,
+  distanceToBvh,
+  raycastBvh,
+  trianglesFromObject,
+} from "./deviation.js";
+import type { DeviationCluster, TriangleBvh } from "./deviation.js";
 import { OverlayRenderer } from "./overlay.js";
 import { ComputeRasterizer, ComputeSink, OVERLAY_DEPTH_FORMAT } from "./sink-compute.js";
 import { PointsRasterizer, PointsSink } from "./sink-points.js";
@@ -152,6 +173,75 @@ export function scalarRangeFor(
   // default, which is right far more often than a collapsed one.
   if (!(b > a)) return [0, 65535];
   return [a, b];
+}
+
+/** What to decode, as the fragment of `PointDataOptions` that says it. */
+export interface PointDecodeSelection {
+  readonly attributes?: readonly string[];
+  readonly scalarFormat?: "gpu";
+  readonly lanes?: Readonly<Record<string, "f32">>;
+}
+
+/**
+ * Which per-point attributes come off the file.
+ *
+ * The class is decoded whenever the cloud HAS one, not only when a colour mode
+ * paints by it: a class the user hid must stay hidden after switching to RGB,
+ * and a value never read off the file cannot reach the GPU to be filtered. It
+ * costs one 4-byte lane per point on a cloud carrying both RGB and classes.
+ *
+ * The trap this exists to keep shut: naming ANY attribute REPLACES the default
+ * selection of position + colour instead of adding to it, so once the class is
+ * asked for the colour has to be named back or an RGB cloud silently loses its
+ * colour. Naming the scalar still deselects colour, which stays right — no mode
+ * reads both, and not fetching it halves the bytes per point on a cloud that
+ * has both.
+ *
+ * `scalarAttribute` is the one the colour mode reads, already checked to exist.
+ */
+export function pointDecodeSelection(
+  source: PointCloudSourceBase,
+  scalarAttribute: string | undefined,
+): PointDecodeSelection {
+  const classAttribute = source.attributesByName.has(CLASS_ATTRIBUTE)
+    ? CLASS_ATTRIBUTE
+    : undefined;
+  // Deduped, because the classification mode names the same attribute twice:
+  // once as the thing it paints by, once as the thing it hides by.
+  const scalars = [
+    ...new Set(
+      [scalarAttribute, classAttribute].filter((a): a is string => a !== undefined),
+    ),
+  ];
+  // Nothing to add means the DEFAULT selection, spelled by saying nothing —
+  // which is exactly position + colour, and provably what this did before.
+  if (scalars.length === 0) return {};
+  const color = source.attributes.find((a) => a.role === "color");
+  return {
+    attributes:
+      scalarAttribute === undefined && color !== undefined
+        ? [color.name, ...scalars]
+        : scalars,
+    scalarFormat: "gpu",
+    lanes: Object.fromEntries(scalars.map((a) => [a, "f32" as const])),
+  };
+}
+
+/**
+ * Quem um corte atinge.
+ *
+ * `"all"` é o DEC-B6 — pontos e modelo juntos, que é o que uma SEÇÃO tem de
+ * fazer. `"model"` corta só o BIM e deixa o levantamento intacto: é o "tirar o
+ * telhado para ver dentro", uma vista de apresentação e não uma medição.
+ */
+export type ClipTarget = "all" | "model";
+
+/** Why the GPU device died. `reason` is the browser's, verbatim. */
+export interface DeviceLostInfo {
+  readonly reason: string;
+  readonly message: string;
+  /** Seconds of wall clock the view had been alive. */
+  readonly afterSeconds: number;
 }
 
 export interface ViewStats {
@@ -285,6 +375,16 @@ export interface PointCloudViewOptions {
    */
   readonly forceWebGL?: boolean;
   /**
+   * Called when the WebGPU device dies, with the reason the browser gives.
+   *
+   * There is nothing to recover automatically — every buffer went with it — but
+   * there is everything to SAY. Without this the failure is invisible: the
+   * library keeps submitting to a dead device, every submit is dropped without
+   * throwing, the canvas simply stops updating, and the console stays empty.
+   * "It went black and nothing appeared" is what that looks like from outside.
+   */
+  readonly onDeviceLost?: (info: DeviceLostInfo) => void;
+  /**
    * Cancel an in-flight node fetch once the camera has moved past it and the
    * fetch queue is saturated. Default `true`.
    *
@@ -351,10 +451,16 @@ export interface ViewProfileOptions extends ProfileExtractionOptions {
 }
 
 interface CloudHandle {
+  /**
+   * Escondida por `setCloudVisible`. Mutável: é uma decisão de quadro, não uma
+   * propriedade da nuvem, e nada em disco muda.
+   */
+  hidden: boolean;
   readonly source: PointCloudSourceBase;
   readonly hierarchy: PointCloudTreeBase;
   readonly object: PointCloudObject3D;
-  readonly material: PointCloudMaterial;
+  /** Present only on the instanced path; see `makeMaterial` on the view. */
+  readonly material: PointCloudMaterial | undefined;
   /**
    * The selected cut, rebuilt every frame and read by the vertex stage to size
    * each splat by the pitch of the finest data at its own position rather than
@@ -466,10 +572,36 @@ export function cloudPitchFloor(h: {
  * cancellable step that creates the device. Nothing happens at module scope, so
  * importing this package is safe under SSR and in Node.
  */
+/**
+ * The instanced sinks draw through three and cannot exist without the material,
+ * which arrives with three's renderer in `init`. Reaching here without one
+ * means `addCloud` ran first — a sequencing mistake, and one worth naming: the
+ * alternative was a cloud that silently drew nothing.
+ */
+function requireMaterial(m: PointCloudMaterial | undefined): PointCloudMaterial {
+  if (m === undefined) {
+    throw new VoxelkloudError(
+      "webgpu-unavailable",
+      "The instanced rasteriser needs a material, which `init` loads together " +
+        "with three's renderer. Await `view.init()` before `addCloud`.",
+    );
+  }
+  return m;
+}
+
 export class PointCloudView {
   readonly scene = new Scene();
   readonly camera: PerspectiveCamera;
-  readonly renderer: WebGPURenderer;
+  /**
+   * three's renderer, present ONLY on the instanced path.
+   *
+   * It was non-optional and always constructed. Now compute and points open
+   * their own device or GL 2 context and never build one, so a caller reaching
+   * for it has to check — the type says so.
+   */
+  get renderer(): WebGPURenderer | undefined {
+    return this.threeRenderer;
+  }
   readonly stats: ViewStats = {
     frameMs: 0,
     selectMs: 0,
@@ -528,6 +660,42 @@ export class PointCloudView {
   /** The WebGL 2 points path's frame-level half, and the context it draws with. */
   private pointsRaster: PointsRasterizer | undefined;
   private gl: WebGL2RenderingContext | undefined;
+  /**
+   * three's renderer, and ONLY for the instanced path.
+   *
+   * It used to own the canvas for all three rasterisers, which meant every
+   * consumer downloaded and initialised three's WebGPU build even to draw a
+   * single point through raw WebGL. Measured: `WebGPURenderer.init()` alone
+   * costs 27 ms against 3 ms for `requestAdapter` + `requestDevice` +
+   * `configure`, on top of 62 kB gzipped that never had to arrive.
+   */
+  private threeRenderer: WebGPURenderer | undefined;
+  /**
+   * `createPointMaterial`, loaded with three's renderer or not at all.
+   *
+   * `addCloud` is synchronous and cannot await an import, so the instanced
+   * branch of `init` puts it here first. A caller who adds a cloud before
+   * awaiting `init` therefore gets no material — which is already true of the
+   * rasteriser choice itself, and is reported the same way.
+   */
+  private makeMaterial: typeof createPointMaterial | undefined;
+  /**
+   * Set once the device dies, and never cleared: a lost device cannot come back,
+   * and pretending otherwise would have the render loop spin on a corpse.
+   */
+  private lostInfo: DeviceLostInfo | undefined;
+  /** Non-null once the device is gone. Read it before trusting a black frame. */
+  get deviceLost(): DeviceLostInfo | undefined {
+    return this.lostInfo;
+  }
+  /** First few uncaptured GPU errors, in order. Validation failures land here. */
+  readonly gpuErrors: string[] = [];
+  private readonly bornAt = typeof performance !== "undefined" ? performance.now() : 0;
+  /** The device and swapchain the compute path draws into. Ours, not three's. */
+  private device: GPUDevice | undefined;
+  private gpuContext: GPUCanvasContext | undefined;
+  /** What `renderer.getPixelRatio()` used to answer. */
+  private pixelRatio = 1;
   private overlay: OverlayRenderer | undefined;
   /** What actually drew, after capability resolution. Public so a caller can
    *  see that a compute request fell back rather than guess from a frame time. */
@@ -540,23 +708,21 @@ export class PointCloudView {
   private edl: EdlPipeline | undefined;
   /** Held so a cloud added after the cut still gets it. */
   private clipPlanes: Float32Array | undefined;
+  private clipTarget: ClipTarget = "all";
+  /** O teto onde o kernel para; a verificação compara contra o mínimo com ele. */
+  private deviationCeiling = 5;
+  /** A árvore da última medição, para agrupar o desvio sem a reconstruir. */
+  private deviationBvh: TriangleBvh | undefined;
 
   constructor(private readonly options: PointCloudViewOptions) {
     this.camera = new PerspectiveCamera(60, 1, 1, 20_000);
     // Potree v2 data is Z-up CRS; three defaults to Y-up, which puts every
     // terrain cloud on its side.
     this.camera.up.set(0, 0, 1);
-    this.renderer = new WebGPURenderer({
-      canvas: options.canvas,
-      antialias: false,
-      // Forcing the fallback is how it gets TESTED. A path that only runs on
-      // hardware nobody on the team has is a path nobody finds out is broken.
-      ...(options.forceWebGL === true ? { forceWebGL: true } : {}),
-    });
-    // NOT optional. Without it the model-view product is computed in float32 IN
-    // THE SHADER, and cloud-relative positions come out WORSE than absolute
-    // ones — a measured 34.1 px of jitter against 29.2 px. With it, 0.46 px.
-    this.renderer.highPrecision = true;
+    // NO renderer here. Which one exists — if any — is a capability question,
+    // and capability is only knowable in `init`, which is async. The background
+    // is held instead of pushed, and applied by whichever path wins.
+    this.pixelRatio = 1;
     this.targetNamed =
       options.lod?.targetScreenError !== undefined ||
       options.lod?.targetPixelSpacing !== undefined;
@@ -585,72 +751,141 @@ export class PointCloudView {
 
   async init(): Promise<void> {
     if (this.initialized) return;
-    await this.renderer.init();
-    // Read AFTER init: three constructs a Camera with the WebGL convention and
-    // Renderer.render overwrites it at first render, so the camera is not a
-    // trustworthy source for this.
-    this.depthRange =
-      this.renderer.coordinateSystem === 2000 ? "zero-to-one" : "minus-one-to-one";
-    // AFTER `renderer.init`: PostProcessing builds a quad and a render target
-    // against the live backend, so it needs a device.
-    if (this.options.edl !== undefined && !this.wantsCompute()) {
-      this.edl = createEdlPipeline(
-        this.renderer,
-        this.scene,
-        this.camera,
-        this.options.edl,
-      );
-    }
-    // The compute path needs the raw device and swapchain three just opened.
-    // Reached through the backend rather than re-created, because a second
-    // device would mean a second copy of every buffer.
-    if (this.wantsCompute()) {
-      const backend = (this.renderer as unknown as {
-        backend?: { device?: GPUDevice; context?: GPUCanvasContext };
-      }).backend;
-      const device = backend?.device;
-      const context = backend?.context;
-      if (device !== undefined && context !== undefined && typeof navigator !== "undefined") {
-        this.raster = new ComputeRasterizer(
-          device,
-          context,
-          navigator.gpu.getPreferredCanvasFormat(),
-          {
-            background: this.options.background ?? [0, 0, 0],
-            ...(this.options.edl !== undefined
-              ? {
-                  edl: {
-                    strength: this.options.edl.strength ?? 1,
-                    radius: this.options.edl.radius ?? 1.4,
-                  },
-                }
-              : {}),
+    const canvas = this.options.canvas;
+    const bg = this.options.background ?? [0, 0, 0];
+    const edlOpts =
+      this.options.edl !== undefined
+        ? {
+            edl: {
+              strength: this.options.edl.strength ?? 1,
+              radius: this.options.edl.radius ?? 1.4,
+            },
+          }
+        : {};
+
+    // COMPUTE first, on a device we open ourselves. Nothing here goes through
+    // three: the rasteriser writes its own WGSL and the overlay draws straight
+    // to the swapchain.
+    if (this.wantsCompute() && typeof navigator !== "undefined" && navigator.gpu !== undefined) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+        // The default maxStorageBufferBindingSize is 128 MiB, which a point
+        // budget past ~11M points overruns on the position buffer alone. The
+        // adapter almost always offers more — ask for all of it, and let the
+        // sink clamp its capacity to whatever the device actually granted.
+        const device = await adapter?.requestDevice({
+          requiredLimits: {
+            maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+            maxBufferSize: adapter.limits.maxBufferSize,
           },
-        );
-        this.rasterizer = "compute";
+        });
+        if (device !== undefined) {
+          // The context is claimed LAST, and only once the device is in hand: a
+          // canvas gives out one context type for its lifetime, so claiming
+          // "webgpu" before knowing compute can run would make the WebGL 2
+          // fallback unreachable on the same canvas.
+          const ctx = canvas.getContext("webgpu") as GPUCanvasContext | null;
+          if (ctx !== null) {
+            const format = navigator.gpu.getPreferredCanvasFormat();
+            ctx.configure({ device, format, alphaMode: "opaque" });
+            this.device = device;
+            this.gpuContext = ctx;
+            // BEFORE the first submit. A device can be lost at any moment —
+            // a driver reset, the machine sleeping, another process taking the
+            // VRAM — and the only signal is this promise.
+            void device.lost.then((info) => {
+              this.lostInfo = {
+                reason: String(info.reason),
+                message: String(info.message),
+                afterSeconds:
+                  Math.round(((performance.now() - this.bornAt) / 1000) * 10) / 10,
+              };
+              this.options.onDeviceLost?.(this.lostInfo);
+            });
+            // Validation errors do not throw and do not reject anything: they
+            // are delivered here or nowhere, and a shader that fails validation
+            // simply draws nothing.
+            device.addEventListener("uncapturederror", (e) => {
+              if (this.gpuErrors.length >= 24) return;
+              const err = (e as GPUUncapturedErrorEvent).error;
+              this.gpuErrors.push(String(err?.message ?? err));
+            });
+            this.raster = new ComputeRasterizer(device, ctx, format, {
+              background: bg,
+              ...edlOpts,
+            });
+            this.rasterizer = "compute";
+            // WebGPU clip space is 0..1 in z, always. It used to be read off
+            // `renderer.coordinateSystem`; with no renderer the answer is the
+            // API, and the API does not vary.
+            this.depthRange = "zero-to-one";
+          }
+        }
+      } catch {
+        // A refused adapter or device is a FALLBACK, not a failure: points and
+        // instanced are both still reachable, and a throw here would take the
+        // whole view down over a capability question.
+        this.device = undefined;
+        this.gpuContext = undefined;
       }
     }
-    // POINTS, where compute did not reach. `backend.gl` is the WebGL 2 context
-    // three opened — the same seam as `backend.device` on the other side.
+
+    // POINTS, where compute did not reach. A plain WebGL 2 context, opened
+    // directly rather than borrowed from a renderer we would otherwise be
+    // paying 62 kB to construct.
     if (this.raster === undefined && this.wantsPoints()) {
-      const backend = (this.renderer as unknown as { backend?: { gl?: WebGL2RenderingContext } }).backend;
-      const gl = backend?.gl;
-      if (gl !== undefined && typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext) {
-        this.pointsRaster = new PointsRasterizer(gl, {
-          background: this.options.background ?? [0, 0, 0],
-          ...(this.options.edl !== undefined
-            ? {
-                edl: {
-                  strength: this.options.edl.strength ?? 1,
-                  radius: this.options.edl.radius ?? 1.4,
-                },
-              }
-            : {}),
-        });
+      const gl = canvas.getContext("webgl2", {
+        alpha: false,
+        antialias: false,
+        depth: true,
+        // The capture harness reads pixels back after the frame, and without
+        // this the buffer is undefined by then on some drivers.
+        preserveDrawingBuffer: false,
+        powerPreference: "high-performance",
+      }) as WebGL2RenderingContext | null;
+      if (gl !== null) {
+        this.pointsRaster = new PointsRasterizer(gl, { background: bg, ...edlOpts });
         this.gl = gl;
         this.rasterizer = "points";
+        this.depthRange = "minus-one-to-one";
       }
     }
+
+    // INSTANCED, the last fallback, and the ONLY path that needs three's
+    // renderer — it draws `NodeMaterial` through three, and EDL here is three's
+    // `PostProcessing`. Both live in the WebGPU build, so both arrive now or
+    // never.
+    if (this.raster === undefined && this.pointsRaster === undefined) {
+      const { WebGPURenderer } = await import("three/webgpu");
+      const renderer = new WebGPURenderer({
+        canvas,
+        antialias: false,
+        // Forcing the fallback is how it gets TESTED. A path that only runs on
+        // hardware nobody on the team has is a path nobody finds out is broken.
+        ...(this.options.forceWebGL === true ? { forceWebGL: true } : {}),
+      });
+      // NOT optional. Without it the model-view product is computed in float32
+      // IN THE SHADER, and cloud-relative positions come out WORSE than
+      // absolute ones — a measured 34.1 px of jitter against 29.2 px. With it,
+      // 0.46 px.
+      renderer.highPrecision = true;
+      renderer.setClearColor(new Color(bg[0], bg[1], bg[2]), 1);
+      renderer.setPixelRatio(this.pixelRatio);
+      await renderer.init();
+      this.threeRenderer = renderer;
+      this.rasterizer = "instanced";
+      ({ createPointMaterial: this.makeMaterial } = await import("./material.js"));
+      // Read AFTER init: three constructs a Camera with the WebGL convention
+      // and `render` overwrites it at first render, so the camera is not a
+      // trustworthy source for this.
+      this.depthRange =
+        renderer.coordinateSystem === 2000 ? "zero-to-one" : "minus-one-to-one";
+      if (this.options.edl !== undefined) {
+        const { createEdlPipeline } = await import("./edl.js");
+        this.edl = createEdlPipeline(renderer, this.scene, this.camera, this.options.edl);
+      }
+    }
+
     this.initialized = true;
     this.dirty = true;
   }
@@ -694,21 +929,18 @@ export class PointCloudView {
       );
     }
 
-    // Naming the scalar deselects colour, which is right: none of the modes
-    // that read a scalar also read RGB, and not fetching it halves the bytes
-    // per point on a cloud that has both.
+    // Task 4 writes the SOURCE alpha when the colour attribute has four
+    // elements, so whether the arena must stamp it is a per-cloud fact, decided
+    // here rather than sniffed per node.
+    const color = source.attributes.find((a) => a.role === "color");
+    const needsAlphaStamp = (color?.numElements ?? 3) >= 4;
+
     const reader = openPoints({
       computeBounds: true,
       ...(this.options.decompress !== undefined
         ? { decompress: this.options.decompress }
         : {}),
-      ...(scalarAttribute !== undefined
-        ? {
-            attributes: [scalarAttribute],
-            scalarFormat: "gpu" as const,
-            lanes: { [scalarAttribute]: "f32" as const },
-          }
-        : {}),
+      ...pointDecodeSelection(source, scalarAttribute),
     });
 
     const materialOptions = {
@@ -724,18 +956,16 @@ export class PointCloudView {
         : {}),
       ...this.materialOptions,
     };
-    const material = createPointMaterial(materialOptions);
+    // Only the instanced path has one, because only it renders through three.
+    // Compute and points take their splat sizing from `resolved` below — the
+    // same numbers the material would have derived — and never touch it.
+    const material = this.makeMaterial?.(materialOptions);
     // The compute path needs the SAME resolved numbers the material derived —
     // splat multiplier, pixel clamps, ramp ranges — so both rasterisers size a
     // splat identically and a comparison between them is a comparison.
     const resolved = resolvePointMaterialOptions(materialOptions);
-    // Task 4 writes the SOURCE alpha when the colour attribute has four
-    // elements, so whether the arena must stamp it is a per-cloud fact, decided
-    // here rather than sniffed per node.
-    const color = source.attributes.find((a) => a.role === "color");
-    const needsAlphaStamp = (color?.numElements ?? 3) >= 4;
     const cut = new OctreeCut(this.lodOptions.maxNodes);
-    material.uCutMap.value = cut.map;
+    if (material !== undefined) material.uCutMap.value = cut.map;
 
     // Resolved here, not in `init`: a caller who never awaited `init` has no
     // device yet, and silently drawing through a different rasteriser than the
@@ -751,7 +981,7 @@ export class PointCloudView {
     const root0 = hierarchy.root;
     const computeSink = useCompute
       ? new ComputeSink(
-          (this.renderer as unknown as { backend: { device: GPUDevice } }).backend.device,
+          this.device!,
           this.raster!,
           cut,
           {
@@ -772,7 +1002,10 @@ export class PointCloudView {
           scalarAttribute,
         )
       : undefined;
-    computeSink?.setClipPlanes(this.clipPlanes);
+    // Uma nuvem que chega depois adota o corte vigente — mas só se ele for
+    // dela. Sem isto, abrir uma segunda nuvem com um corte "model" activo
+    // fatiaria a nuvem nova e nenhuma das outras.
+    computeSink?.setClipPlanes(this.clipTarget === "all" ? this.clipPlanes : undefined);
     const pointsSink =
       this.pointsRaster !== undefined && this.gl !== undefined
         ? new PointsSink(
@@ -794,16 +1027,17 @@ export class PointCloudView {
               background: this.options.background ?? [0, 0, 0],
             },
             scalarAttribute,
+            this.pointsRaster.pointProg,
           )
         : undefined;
     const sink =
       computeSink ??
       pointsSink ??
       ((this.options.sinkMode ?? "auto") === "per-node"
-        ? new PerNodeSink(object, material, scalarAttribute)
+        ? new PerNodeSink(object, requireMaterial(material), scalarAttribute)
         : new ArenaSink(
             object,
-            material,
+            requireMaterial(material),
             (l) => hierarchy.pointSpacingAt(l),
             (l) => hierarchy.boundingRadiusAt(l),
             needsAlphaStamp,
@@ -831,19 +1065,22 @@ export class PointCloudView {
     // corner and the cube extent — written out rather than assumed, so a format
     // whose root box is not the indexing volume still walks the right box.
     const root = hierarchy.root;
-    material.uRootMin.value = {
-      x: root.minX - origin[0],
-      y: root.minY - origin[1],
-      z: root.minZ - origin[2],
-    };
-    material.uRootSize.value = {
-      x: root.maxX - root.minX,
-      y: root.maxY - root.minY,
-      z: root.maxZ - root.minZ,
-    };
+    if (material !== undefined) {
+      material.uRootMin.value = {
+        x: root.minX - origin[0],
+        y: root.minY - origin[1],
+        z: root.minZ - origin[2],
+      };
+      material.uRootSize.value = {
+        x: root.maxX - root.minX,
+        y: root.maxY - root.minY,
+        z: root.maxZ - root.minZ,
+      };
+    }
 
     this.scene.add(object);
     this.clouds.push({
+      hidden: false,
       source,
       hierarchy,
       object,
@@ -929,8 +1166,9 @@ export class PointCloudView {
    */
   private overlayFor(): OverlayRenderer | undefined {
     if (this.scene.children.length === 0) return undefined;
-    const device = (this.renderer as unknown as { backend?: { device?: GPUDevice } }).backend
-      ?.device;
+    // Our device now, not one reached out of three's backend. The overlay is
+    // WebGPU-only either way, so a WebGL 2 view simply has none.
+    const device = this.device;
     if (device === undefined) return undefined;
     this.overlay ??= new OverlayRenderer(
       device,
@@ -987,6 +1225,41 @@ export class PointCloudView {
   }
 
   /**
+   * B4 — regista o modelo e constrói a árvore uma vez.
+   *
+   * Separado de `setDeviationMesh` de propósito: o alinhamento precisa da
+   * árvore ANTES de existir medição nenhuma — é ela que responde "onde no
+   * projeto o cursor caiu". Construir duas seria construir a mesma.
+   */
+  setModel(model: { updateMatrixWorld(force?: boolean): void; traverse(cb: (o: unknown) => void): void }): number {
+    this.scene.updateMatrixWorld(true);
+    const g = trianglesFromObject(model as unknown as Parameters<typeof trianglesFromObject>[0]);
+    this.deviationBvh = buildTriangleBvh(g.tris, g.features);
+    return this.deviationBvh.triCount;
+  }
+
+  /**
+   * Onde o cursor encontra o MODELO, em coordenadas de cena.
+   *
+   * A outra metade do alinhamento manual: `pickPoint` diz onde o cursor caiu na
+   * nuvem, este diz onde caiu no projeto, e um par dos dois é uma restrição.
+   *
+   * Raio na CPU contra a árvore, e não leitura de profundidade da GPU: a
+   * árvore já existe, a resposta é exata em vez de reconstruída de um buffer de
+   * profundidade quantizado, e funciona com a página parada.
+   */
+  pickModelPoint(screenX: number, screenY: number): { point: [number, number, number]; feature: number } | undefined {
+    const bvh = this.deviationBvh;
+    if (bvh === undefined || this.drawSize.x === 0) return undefined;
+    const ndcX = (screenX * this.pixelRatio / this.drawSize.x) * 2 - 1;
+    const ndcY = 1 - (screenY * this.pixelRatio / this.drawSize.y) * 2;
+    const origin = this.camera.position;
+    const dir = new Vector3(ndcX, ndcY, 0.5).unproject(this.camera).sub(origin).normalize();
+    const hit = raycastBvh(bvh, origin.x, origin.y, origin.z, dir.x, dir.y, dir.z);
+    return hit === undefined ? undefined : { point: hit.point, feature: hit.feature };
+  }
+
+  /**
    * B5 — mede a nuvem contra esta malha.
    *
    * Constrói a BVH uma vez, entrega-a a cada nuvem e corre o kernel. O
@@ -1001,16 +1274,161 @@ export class PointCloudView {
    */
   setDeviationMesh(model: { updateMatrixWorld(force?: boolean): void; traverse(cb: (o: unknown) => void): void }, maxDistance = 5): number {
     if (this.disposed) return 0;
-    const tris = trianglesFromObject(model as unknown as Parameters<typeof trianglesFromObject>[0]);
-    const bvh = buildTriangleBvh(tris);
+    // A CENA inteira, e não só o modelo. `trianglesFromObject` atualiza a
+    // matriz a partir do nó que recebe, mas essa matriz é `pai.matrixWorld *
+    // local` — e o pai é quem carrega o alinhamento da B4. Chamado antes do
+    // primeiro frame, o pai ainda tem matriz IDENTIDADE, e a BVH sai construída
+    // na origem, a mais de um quilômetro dos pontos.
+    //
+    // Foi exatamente o que aconteceu, e quem acusou foi o oráculo em CPU: o
+    // kernel dizia 0,39 m onde a referência dizia 1.208 m para o mesmo ponto.
+    // Sem essa comparação, o mapa de cores estaria plausível e errado.
+    this.scene.updateMatrixWorld(true);
+    const geo = trianglesFromObject(model as unknown as Parameters<typeof trianglesFromObject>[0]);
+    const bvh = buildTriangleBvh(geo.tris, geo.features);
+    this.deviationBvh = bvh;
     let measured = 0;
     for (const h of this.clouds) {
       const e = h.object.matrixWorld.elements;
       h.computeSink?.setDeviationMesh(bvh.nodes, bvh.tris, [e[12]!, e[13]!, e[14]!], maxDistance);
+      this.deviationCeiling = maxDistance;
       measured += h.computeSink?.runDeviation() ?? 0;
     }
     this.dirty = true;
     return measured;
+  }
+
+  /**
+   * Confere o kernel do desvio contra a referência em CPU, num punhado de
+   * pontos. O erro devolvido é em METROS: acima de um milímetro alguma coisa
+   * discorda, e o mapa de cores está a mentir por essa margem.
+   */
+  async checkDeviation(
+    model: { updateMatrixWorld(force?: boolean): void; traverse(cb: (o: unknown) => void): void },
+    samples = 200_000,
+  ): Promise<
+    | {
+        meanDeviation: number;
+        checked: number;
+        informative: number;
+        maxError: number;
+        meanError: number;
+        sampleGpu: number[];
+        sampleCpu: number[];
+      }
+    | undefined
+  > {
+    const h = this.clouds[0];
+    if (h?.computeSink === undefined) return undefined;
+    const got = await h.computeSink.readDeviationSample(samples);
+    if (got === undefined) return undefined;
+
+    const g = trianglesFromObject(model as unknown as Parameters<typeof trianglesFromObject>[0]);
+    const bvh = buildTriangleBvh(g.tris, g.features);
+    // O MESMO offset que o kernel usou, lido do sink, e não relido da matriz:
+    // a matriz pode ter sido atualizada entre a medição e a verificação, e aí a
+    // comparação mede duas cenas diferentes.
+    const t = h.computeSink.deviationToScene;
+    const ceiling = this.deviationCeiling;
+
+    let maxError = 0;
+    let sum = 0;
+    let checked = 0;
+    let informative = 0;
+    // Procura os pontos ABAIXO DO TETO em vez de amostrar às cegas. Num
+    // ladrilho de 1 km os pontos perto do prédio são uma fração minúscula: um
+    // passo uniforme apanhava 12 informativos em 2000 e o resto só confirmava o
+    // clamp. Aqui o teste vai atrás justamente de quem exercita a travessia.
+    const near: number[] = [];
+    const far: number[] = [];
+    for (let i = 0; i < got.deviations.length; i++) {
+      const d = got.deviations[i]!;
+      if (!Number.isFinite(d)) continue;
+      if (d < ceiling * 0.999) {
+        if (near.length < 1500) near.push(i);
+      } else if (far.length < 500 && far.length * 97 < i) far.push(i);
+    }
+    for (const i of [...near, ...far]) {
+      const gpu = got.deviations[i]!;
+      const cpu = distanceToBvh(
+        bvh,
+        got.positions[i * 3]! + t[0],
+        got.positions[i * 3 + 1]! + t[1],
+        got.positions[i * 3 + 2]! + t[2],
+      );
+      // O kernel para no teto por desenho, logo a expectativa é o MÍNIMO entre
+      // a distância verdadeira e o teto. Comparar contra a verdadeira acusaria
+      // um erro que não existe — foi o filtro errado da primeira tentativa, que
+      // descartou 300 de 300 amostras e reportou "0 conferidos".
+      const expected = Math.min(cpu, ceiling);
+      if (expected < ceiling) informative++;
+      const err = Math.abs(expected - gpu);
+      if (err > maxError) maxError = err;
+      sum += err;
+      checked++;
+    }
+    // A média do desvio dos informativos — não do ERRO. É este número que o
+    // critério de aceite move: deslocar o alinhamento 20 cm tem de o mover
+    // 20 cm.
+    let devSum = 0;
+    let devN = 0;
+    for (const i of near) {
+      const d = got.deviations[i]!;
+      if (Number.isFinite(d) && d < ceiling * 0.999) {
+        devSum += d;
+        devN++;
+      }
+    }
+    return {
+      meanDeviation: devN === 0 ? 0 : devSum / devN,
+      checked,
+      informative,
+      maxError,
+      meanError: checked === 0 ? 0 : sum / checked,
+      sampleGpu: Array.from(got.deviations.slice(0, 6)),
+      sampleCpu: Array.from({ length: 6 }, (_, k) =>
+        distanceToBvh(bvh, got.positions[k * 3]! + t[0], got.positions[k * 3 + 1]! + t[1], got.positions[k * 3 + 2]! + t[2]),
+      ),
+    };
+  }
+
+  /**
+   * As regiões fora da tolerância, prontas para virar tópicos.
+   *
+   * Devolve posições em coordenadas de CENA. Quem exporta soma a origem da
+   * nuvem antes de escrever no BCF: o destinatário abre num Revit que nunca
+   * ouviu falar da nossa origem.
+   */
+  async deviationClusters(options: {
+    tolerance: number;
+    cell?: number;
+    minPoints?: number;
+  }): Promise<DeviationCluster[]> {
+    const h = this.clouds[0];
+    if (h?.computeSink === undefined) return [];
+    const got = await h.computeSink.readDeviationSample(400_000);
+    if (got === undefined) return [];
+    const t = h.computeSink.deviationToScene;
+    // As posições vêm em coordenadas locais da nuvem; o agrupamento e a BVH
+    // falam coordenadas de cena.
+    const scene = new Float32Array(got.positions.length);
+    for (let i = 0; i < got.positions.length; i += 3) {
+      scene[i] = got.positions[i]! + t[0];
+      scene[i + 1] = got.positions[i + 1]! + t[1];
+      scene[i + 2] = got.positions[i + 2]! + t[2];
+    }
+    return clusterDeviation(scene, got.deviations, {
+      tolerance: options.tolerance,
+      ceiling: this.deviationCeiling,
+      ...(options.cell !== undefined ? { cell: options.cell } : {}),
+      ...(options.minPoints !== undefined ? { minPoints: options.minPoints } : {}),
+      ...(this.deviationBvh !== undefined ? { bvh: this.deviationBvh } : {}),
+    });
+  }
+
+  /** Os desvios crus da GPU, para quem quiser comparar duas medições. */
+  async readDeviations(n = 200_000): Promise<Float32Array | undefined> {
+    return (await this.clouds[0]?.computeSink?.readDeviationSample(n))?.deviations;
   }
 
   /** Remede depois de a nuvem ter carregado mais pontos. */
@@ -1025,14 +1443,25 @@ export class PointCloudView {
    * Cross-section planes, in SCENE coordinates: `[nx, ny, nz, d]` each, four at
    * most. The positive half-space survives, which is three's convention.
    *
-   * They cut the POINTS and the MODEL with one call, and that is the whole
-   * decision (DEC-B6): a section that slices the scan and leaves the wall
-   * standing is worse than no section, because it looks like an answer.
+   * By default they cut the POINTS and the MODEL with one call, and that is
+   * DEC-B6: a SECTION that slices the scan and leaves the wall standing is
+   * worse than no section, because it looks like an answer.
+   *
+   * `target: "model"` is the deliberate exception, and it is a different
+   * feature wearing the same maths — taking the roof off the BIM to look
+   * inside, with the scan left alone. It does not claim to be a section and no
+   * measurement reads from it, which is exactly why it escapes DEC-B6. Keep the
+   * two apart in the UI: a control that silently switches between them would
+   * reintroduce the misleading answer the decision exists to prevent.
    */
-  setClipPlanes(planes: Float32Array | undefined): void {
+  setClipPlanes(planes: Float32Array | undefined, target: ClipTarget = "all"): void {
     this.clipPlanes = planes;
+    this.clipTarget = target;
+    // The overlay is cut either way — it is the one geometry both targets
+    // include. The points are cut only when the section is theirs too.
     this.overlay?.setClipPlanes(planes);
-    for (const h of this.clouds) h.computeSink?.setClipPlanes(planes);
+    const forPoints = target === "all" ? planes : undefined;
+    for (const h of this.clouds) h.computeSink?.setClipPlanes(forPoints);
     this.dirty = true;
   }
 
@@ -1043,6 +1472,94 @@ export class PointCloudView {
    */
   setElementVisibility(mask: Uint32Array | undefined): void {
     this.overlay?.setVisibility(mask);
+    this.dirty = true;
+  }
+
+  /**
+   * Mostrar ou esconder uma nuvem inteira.
+   *
+   * Existe porque a razão para carregar um modelo BIM é OLHAR PARA ELE, e um
+   * levantamento de 28 milhões de pontos por cima torna isso impossível. Não
+   * descarrega nada: a nuvem fica residente e volta no quadro seguinte.
+   */
+  setCloudVisible(cloudIndex: number, visible: boolean): void {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined || h.hidden === !visible) return;
+    h.hidden = !visible;
+    this.dirty = true;
+  }
+
+  /**
+   * Esconder classes ASPRS na vista por classificação.
+   *
+   * Recebe os CÓDIGOS escondidos (2 = solo, 6 = edificação…); qualquer código
+   * fora de 0..18 cai no balde "outros" — o mesmo que o material pinta com a
+   * cor de classe desconhecida.
+   *
+   * Vale em QUALQUER modo de cor no rasterizador compute, porque ali o código
+   * viaja no byte de topo do `nmeta` e não no lane que muda de significado com
+   * o modo. O material instanciado ainda só filtra no modo classificação: lá o
+   * código chega pelo `scalarValue`, que os outros modos usam para outra coisa.
+   */
+  setHiddenClasses(codes: Iterable<number>, cloudIndex = 0): void {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return;
+    let mask = 0;
+    for (const code of codes) {
+      mask |= 1 << (code >= 0 && code <= 18 ? code : 31);
+    }
+    // TODOS os braços do rasterizador, porque um filtro que só age num deles
+    // vira um bug de "funciona na minha máquina": compute é o caminho vivo do
+    // produto, points é o fallback WebGL 2 que o "auto" escolhe quando não há
+    // WebGPU, e o material instanciado é o último recurso.
+    if (h.material !== undefined) h.material.uClassHidden.value = mask >>> 0;
+    h.computeSink?.setClassHidden(mask >>> 0);
+    h.pointsSink?.setClassHidden(mask >>> 0);
+    this.dirty = true;
+  }
+
+  /**
+   * Que códigos ASPRS esta nuvem realmente contém, crescente.
+   *
+   * Para a UI listar as classes que existem em vez das vinte do padrão. Só
+   * conhece o que já foi anexado, então cresce enquanto o streaming corre — e
+   * nunca encolhe, para a lista não piscar quando um nó é descarregado.
+   *
+   * Vazio no braço instanciado, que não faz esta contagem: quem depende dela
+   * tem de tratar vazio como "não sei", e não como "esta nuvem não tem classes".
+   */
+  presentClasses(cloudIndex = 0): readonly number[] {
+    const h = this.clouds[cloudIndex];
+    return h?.computeSink?.presentClasses ?? h?.pointsSink?.presentClasses ?? [];
+  }
+
+  /**
+   * A origem da cena: o que se subtrai de uma coordenada do CRS para chegar ao
+   * espaço em que a cena vive.
+   *
+   * Existe porque as coordenadas de um levantamento são grandes — 92.500 m em
+   * RD New — e float32 não as segura: a geometria treme a metros da câmera. A
+   * cena trabalha perto de zero e a origem é a diferença.
+   *
+   * Quem grava uma colocação PRECISA disto: uma matriz em coordenadas de cena
+   * só vale enquanto esta nuvem estiver aberta, e é a de CRS que se guarda.
+   */
+  sceneOrigin(cloudIndex = 0): [number, number, number] | undefined {
+    const h = this.clouds[cloudIndex];
+    return h === undefined ? undefined : (h.object.getSceneOrigin() as [number, number, number]);
+  }
+
+  /**
+   * Raio-x: o modelo desenha POR CIMA da nuvem em vez de ser ocultado por ela.
+   *
+   * É o modo que todo visualizador AEC tem, e aqui custa um flag no uniform
+   * porque a oclusão entre malha e pontos é nossa: é o mesmo teste de
+   * profundidade, saltado. O elemento também fica clicável em raio-x — um modo
+   * em que se olha para uma parede e o clique atravessa seria pior que não ter
+   * o modo.
+   */
+  setModelXray(on: boolean): void {
+    this.overlay?.setXray(on);
     this.dirty = true;
   }
 
@@ -1073,7 +1590,7 @@ export class PointCloudView {
     if (depth === undefined) return undefined;
     const overlay = this.overlayFor();
     if (overlay === undefined) return undefined;
-    const ratio = this.renderer.getPixelRatio();
+    const ratio = this.pixelRatio;
     return overlay.pickFeature(
       this.camera,
       depth,
@@ -1172,8 +1689,18 @@ export class PointCloudView {
   }
 
   setSize(width: number, height: number, pixelRatio = 1): void {
-    this.renderer.setPixelRatio(pixelRatio);
-    this.renderer.setSize(width, height, false);
+    this.pixelRatio = pixelRatio;
+    if (this.threeRenderer !== undefined) {
+      this.threeRenderer.setPixelRatio(pixelRatio);
+      this.threeRenderer.setSize(width, height, false);
+    } else {
+      // What three did for us, and no more: back buffer in device pixels, CSS
+      // box left to the page. `false` for `updateStyle` was already the call,
+      // so the layout contract does not change.
+      const c = this.options.canvas;
+      c.width = Math.max(1, Math.floor(width * pixelRatio));
+      c.height = Math.max(1, Math.floor(height * pixelRatio));
+    }
     this.drawSize.set(width * pixelRatio, height * pixelRatio);
     this.camera.aspect = width / Math.max(height, 1);
     this.camera.updateProjectionMatrix();
@@ -1221,6 +1748,12 @@ export class PointCloudView {
 
   renderFrame(): boolean {
     if (!this.initialized || this.disposed) return false;
+    // A lost device accepts every call and performs none of them. Returning
+    // false here makes the caller's loop report "did not draw" instead of
+    // reporting sixty successful frames a second onto a canvas that has stopped
+    // changing — which is the difference between a diagnosable failure and a
+    // black screen with nothing in the console.
+    if (this.lostInfo !== undefined) return false;
     const t0 = performance.now();
     this.frame++;
     // Camera motion, detected from the world matrix rather than announced by
@@ -1259,7 +1792,8 @@ export class PointCloudView {
     }
 
     this.camera.updateMatrixWorld(true);
-    this.renderer.getDrawingBufferSize(this.drawSize);
+    if (this.threeRenderer !== undefined) this.threeRenderer.getDrawingBufferSize(this.drawSize);
+    else this.drawSize.set(this.options.canvas.width, this.options.canvas.height);
 
     let selectMs = 0;
     let visibleNodes = 0;
@@ -1305,7 +1839,7 @@ export class PointCloudView {
       );
       // Cheap and unconditional: `OctreeCut` replaces its texture only when
       // `maxNodes` grows, and re-assigning the same object is a no-op.
-      h.material.uCutMap.value = h.cut.map;
+      if (h.material !== undefined) h.material.uCutMap.value = h.cut.map;
 
       this.stream(h);
       this.drainPending(h);
@@ -1313,7 +1847,10 @@ export class PointCloudView {
       // because the fact it turns on — whether a node's children are RESIDENT —
       // is only known at this point in the frame. See `replace.ts`.
       const drawn = this.drawList(h);
-      h.sink.setVisible(drawn.indices, drawn.count);
+      // Esconder é desenhar ZERO nós, não descarregar a nuvem. Os dados ficam
+      // residentes, o octree continua a decidir o que seria visível, e voltar a
+      // mostrar é um quadro — não um novo download de centenas de megabytes.
+      h.sink.setVisible(drawn.indices, h.hidden ? 0 : drawn.count);
       h.sink.commit();
 
       h.prevMinSpacing = h.selection.minPointSpacingWorld;
@@ -1390,7 +1927,7 @@ export class PointCloudView {
     // and composites, so calling `renderer.render` as well would draw the frame
     // twice and throw the first one away.
     else if (this.edl !== undefined) this.edl.render();
-    else this.renderer.render(this.scene, this.camera);
+    else this.threeRenderer?.render(this.scene, this.camera);
 
     this.stats.frameMs = performance.now() - t0;
     this.stats.selectMs = selectMs;
@@ -1398,7 +1935,11 @@ export class PointCloudView {
     this.stats.visiblePoints = visiblePoints;
     this.stats.residentNodes = residentNodes;
     this.stats.residentMB = residentBytes / (1024 * 1024);
-    this.stats.drawCalls = this.renderer.info.render.drawCalls;
+    // three counts its own draw calls. The direct paths issue a FIXED number
+    // and know it: compute resolves in one dispatch chain, points is a single
+    // `drawArrays` — the number that made the WebGL fallback worth building.
+    this.stats.drawCalls =
+      this.threeRenderer?.info.render.drawCalls ?? (this.raster !== undefined ? 0 : 1);
     this.stats.slabs = slabs;
     this.stats.loading = loading;
     this.stats.maxLevel = maxLevel;
@@ -1699,13 +2240,20 @@ export class PointCloudView {
       h.sink.dispose();
       h.cut.dispose();
       h.computeSink?.dispose();
-      h.material.dispose();
+      h.material?.dispose();
       this.scene.remove(h.object);
     }
     this.clouds.length = 0;
     this.edl?.dispose();
     this.edl = undefined;
-    this.renderer.dispose();
+    this.threeRenderer?.dispose();
+    this.threeRenderer = undefined;
+    // Ours to destroy, since they are ours to create. A device left alive holds
+    // every buffer it allocated.
+    this.device?.destroy();
+    this.device = undefined;
+    this.gpuContext = undefined;
+    this.gl = undefined;
   }
 }
 

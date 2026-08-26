@@ -6,8 +6,8 @@ import {
   Mesh,
   Sphere,
   Vector3,
-} from "three/webgpu";
-import type { Group, Material } from "three/webgpu";
+} from "three";
+import type { Group, Material } from "three";
 
 /**
  * A view-aligned unit quad, shared in VALUE but never in IDENTITY.

@@ -31,12 +31,12 @@ tick();
 `view.camera` and `view.scene` are the three objects, so OrbitControls and every
 other add-on attach normally.
 
-## Two rasterisers
+## Three rasterisers
 
-`sinkMode` picks how points reach the screen. The default is `"auto"`, which is
-the COMPUTE rasteriser wherever WebGPU gives us a device and the instanced one
-everywhere else. `view.rasterizer` reports which won, so a caller can see a
-fallback instead of inferring it from a frame time.
+`sinkMode` picks how points reach the screen. The default is `"auto"`, which
+resolves in order: **compute** on WebGPU, **points** on WebGL 2, and the
+instanced arena only if neither is reachable. `view.rasterizer` reports which
+won, so a caller can see a fallback instead of inferring it from a frame time.
 
 ```ts
 createPointCloudView({ canvas, sinkMode: "arena" }); // pin the instanced path
@@ -47,27 +47,78 @@ createPointCloudView({ canvas, sinkMode: "arena" }); // pin the instanced path
 One invocation per point: no instancing, no quad envelope, no per-instance
 attribute step.
 
+**Points** draws `gl.POINTS` with a real `gl_PointSize` on WebGL 2 — what Potree
+does, and what WGSL cannot express. It is unreachable through three's node
+system, whose GLSL builder writes `gl_PointSize = 1.0` after our code, so this
+path owns its draw too.
+
 **Instanced** draws a view-aligned quad per point through three. NOT `Points`:
 three's WebGPU backend maps `object.isPoints` to `point-list` topology and WGSL
 has no point-size builtin, so `sizeNode` is silently ignored there and every
 point rasterises as one pixel with no attenuation.
+
+### The instanced path is for COMPOSITION now, not performance
+
+It is the slowest of the three and it is not going away, because it is the only
+one that draws through three's scene graph. Compute and points both own their
+draw, which is what makes them fast and also what stops them composing: a gizmo,
+a mesh, an overlay that has to occlude and be occluded by the cloud only works
+on the instanced path. Pick it deliberately with `sinkMode: "arena"` when a
+scene needs that; the other two are for when the cloud IS the scene.
 
 ### Why compute is the default
 
 Measured on autzen at a 3M budget, same camera, same selected points, runs with
 a contaminated main thread discarded:
 
-| | INP | worst CPU frame |
-| --- | --- | --- |
-| instanced | 272–320 ms | 70.7 ms |
-| **compute** | **56–72 ms** | **9.5 ms** |
-| Potree 1.8, for scale | 136 ms | — |
+| | backend | INP | idle fps |
+| --- | --- | --- | --- |
+| **compute** | WebGPU | **72 ms** | 59.9 |
+| **points** | WebGL 2 | **72 ms** | 59.9 |
+| Potree 1.8, for scale | WebGL | 88 ms | 59.9 |
+| instanced | WebGPU | 272–320 ms | 59.9 |
+| instanced | WebGL 2 | 656 ms | 7.5 |
 
 The cost the instanced path cannot shed is per INSTANCE — the attribute step for
 `pointOffset`, `color` and `scalarValue`, once per splat — and that was found by
 elimination rather than guessed: pinning the splat to 1 px left INP unchanged
 (so not fill rate), a 3-vertex envelope left it unchanged (so not per-vertex),
 and a sweep showed INP linear in instance count.
+
+### Watch them load, frame by frame
+
+[**Convergence race →**](https://voxelkloud.github.io/#measurements)
+
+[![Four rasterisers at 1.9 s after load](docs/bench.png)](https://voxelkloud.github.io/#measurements)
+
+One slider, four renderers, the same millisecond. Drag it and every panel jumps
+together, so what you compare is the picture each one had at that moment rather
+than four frames chosen independently.
+
+Captured at 480x320 over a throttled 2.5 MB/s link with the HTTP cache off, all
+four given a byte-identical camera — eye and direction agree to the last decimal
+place, which is checked before a run rather than assumed:
+
+| | first ink | half way | settled | fps |
+| --- | --- | --- | --- | --- |
+| **compute** (WebGPU) | **436 ms** | 881 ms | 10.4 s | 59.9 |
+| potree-core | 479 ms | 920 ms | 13.4 s | 41.9 |
+| **points** (WebGL 2) | 586 ms | **843 ms** | **9.9 s** | 59.9 |
+| Potree 1.8 | 1286 ms | 1655 ms | 13.7 s | 59.9 |
+
+Half way — when a renderer has closed half the distance to its own final frame,
+which is roughly when the scene stops looking wrong — separates them more than
+settling does, and settling separates them least of all: that column is a
+sanity check, not a podium.
+
+Distance is measured against each arm's OWN final frame, never against another's.
+Comparing one renderer's pixels to another's would measure visual character
+rather than convergence — compute is smooth by construction and points is
+grainy, and neither is lateness.
+
+The page carries its own caveats, including why the Potree arms report no
+resident point count and why a frame rate that lands on exactly 30.0 or 50.0 is
+the machine rather than the renderer.
 
 Both paths share the LOD scheduler, the octree cut, the six colour modes, EDL
 and `pickPoint`, and both size a splat with the same numbers. What differs is

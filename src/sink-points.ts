@@ -1,10 +1,25 @@
 import type { DecodedPointData } from "@voxelkloud/format-potree";
-import type { Matrix4, PerspectiveCamera } from "three/webgpu";
+import type { Matrix4, PerspectiveCamera } from "three";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
-import { FS, FS_EDL, FS_PICK, VS, VS_POST } from "./points-glsl.js";
-import { BlockAllocator } from "./sink-compute.js";
+import { FS, FS_EDL, VS, VS_POST } from "./points-glsl.js";
+import { BlockAllocator, MAX_SLOTS, packNodeMeta } from "./sink-compute.js";
+import { CLASS_ATTRIBUTE } from "./material-options.js";
 import type { PointReadback, PointSink } from "./sink.js";
+
+// NO GPU PICK HERE, deliberately, and the id-writing shader in points-glsl.ts
+// is what a future one would use.
+//
+// It would be a better pick than the CPU one: WebGL 2's `readPixels` is
+// synchronous, so unlike the compute path it needs no async API, and the depth
+// test filters visibility for free — a point that lost it never wrote its id, so
+// what comes back is only what the user can see. `pick.ts` ranks by screen
+// distance with depth as a tiebreak and can return a point hidden behind the
+// splat that was actually clicked.
+//
+// It is not here because it would save nothing yet: `readPoints` also feeds
+// `ground.ts`, so the CPU mirror stays either way, and a linked program with no
+// caller is dead weight.
 
 /** The index the shader switches on, in the order {@link ColorMode} declares. */
 const MODE_INDEX: Record<ColorMode["kind"], number> = {
@@ -35,7 +50,6 @@ export interface PointsSinkOptions {
 
 const CUT_W = 1024;
 const LIVE_W = 1024;
-const MAX_SLOTS = 65_536;
 
 /**
  * A {@link PointSink} that draws its own points with `gl.POINTS` on WebGL 2.
@@ -69,6 +83,8 @@ export class PointsSink implements PointSink {
   private evictedNodes = 0;
   private grewTimes = 0;
   private growMs = 0;
+  /** Only delete the program if this sink built it; a shared one outlives it. */
+  private readonly ownsProg: boolean = true;
   private maxAttachMs = 0;
   private maxCommitMs = 0;
   private attachCalls = 0;
@@ -85,13 +101,16 @@ export class PointsSink implements PointSink {
   private posCpu: Float32Array;
   private colCpu: Uint8Array;
   private scalarCpu: Float32Array | undefined;
+  /** Ver {@link ComputeSink.setClassHidden} — aqui é o mesmo uniform, em GL. */
+  private classHidden = 0;
+  /** Ver {@link ComputeSink.presentClasses}. Preenchido por `packNodeMeta`. */
+  private readonly classPresent = new Uint8Array(256);
 
   private readonly live = new Uint8Array(MAX_SLOTS);
   private readonly lastLive: number[] = [];
   private readonly nodeOfSlot: (number | undefined)[] = [];
 
   private readonly prog: WebGLProgram;
-  private readonly pickProg: WebGLProgram;
   private readonly cutTex: WebGLTexture;
   private readonly liveTex: WebGLTexture;
   private readonly emptyVao: WebGLVertexArrayObject;
@@ -114,6 +133,8 @@ export class PointsSink implements PointSink {
     },
     private readonly options: PointsSinkOptions,
     private readonly scalarAttribute: string | undefined = undefined,
+    /** Shared, and already warmed, from `PointsRasterizer`. */
+    sharedProgram?: WebGLProgram,
   ) {
     this.mode = MODE_INDEX[options.colorMode.kind];
     // 1.6x, not 1.25. Under a moving camera the frontier pulls in nodes before
@@ -125,8 +146,8 @@ export class PointsSink implements PointSink {
     this.maxPointSizePx =
       (gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array)[1] ?? 0;
 
-    this.prog = link(gl, VS, FS, "points");
-    this.pickProg = link(gl, VS, FS_PICK, "points-pick");
+    this.prog = sharedProgram ?? link(gl, VS, FS, "points");
+    this.ownsProg = sharedProgram === undefined;
 
     this.posBuf = buffer(gl, this.capacity * 12);
     this.colBuf = buffer(gl, this.capacity * 4);
@@ -154,7 +175,12 @@ export class PointsSink implements PointSink {
     bind(this.posBuf, gl.getAttribLocation(this.prog, "aPos"), 3, gl.FLOAT, false);
     bind(this.colBuf, gl.getAttribLocation(this.prog, "aColor"), 4, gl.UNSIGNED_BYTE, true);
     bind(this.pitchBuf, gl.getAttribLocation(this.prog, "aPitch"), 1, gl.FLOAT, false);
-    bind(this.metaBuf, gl.getAttribLocation(this.prog, "aMeta"), 1, gl.FLOAT, false);
+    // INTEIRO, não float: `vertexAttribIPointer` entrega os 32 bits sem passar
+    // por uma conversão para float, que é o que faz o byte da classe caber.
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.metaBuf);
+    const metaLoc = gl.getAttribLocation(this.prog, "aMeta");
+    gl.enableVertexAttribArray(metaLoc);
+    gl.vertexAttribIPointer(metaLoc, 1, gl.UNSIGNED_INT, 0, 0);
     gl.bindVertexArray(null);
     return vao;
   }
@@ -346,10 +372,15 @@ export class PointsSink implements PointSink {
     const pitch = new Float32Array(n).fill(spacingWorld);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.pitchBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, start * 4, pitch);
-    // Level and slot in ONE attribute: `slot * 32 + level`. Both are small
-    // integers and float32 is exact to 2^24, so this costs no precision and
-    // saves an attribute — which matters at three million vertices.
-    const meta = new Float32Array(n).fill(slot * 32 + level);
+    // Nível, slot e CLASSE num atributo só, no mesmo layout do braço compute —
+    // ver {@link packNodeMeta}. Era `slot * 32 + level` num float, e a classe
+    // não cabia ali: level, slot e classe somam 29 bits e float32 só é exato
+    // até 2^24. Ligado como INTEIRO o mesmo lane de 4 bytes dá os 32, então a
+    // classe entra sem custo nenhum — e os dois rasterizadores passam a
+    // empacotar pelo mesmo código, que é o que impede os dois layouts de
+    // divergirem em silêncio.
+    const classes = data.attributesByName.get(CLASS_ATTRIBUTE)?.array;
+    const meta = packNodeMeta(level, slot, n, classes, this.classPresent);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.metaBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, start * 4, meta);
     return staged;
@@ -419,7 +450,7 @@ export class PointsSink implements PointSink {
         "uClipFromCloud", "uViewFromCloud", "uProjScale", "uSizeMul", "uMinPx",
         "uMaxPx", "uCut", "uLive", "uUseMask", "uRootMin", "uRootSize",
         "uCutDepth", "uUseCut", "uMode", "uFlatColor", "uElevRange",
-        "uScalarRange", "uMaxLevel", "uRound",
+        "uScalarRange", "uMaxLevel", "uRound", "uClassHidden",
       ];
       u = Object.fromEntries(names.map((n) => [n, this.gl.getUniformLocation(program, n)]));
       this.locCache.set(program, u);
@@ -443,6 +474,7 @@ export class PointsSink implements PointSink {
     gl.uniform1f(u["uSizeMul"]!, o.sizeMultiplier);
     gl.uniform1f(u["uMinPx"]!, o.minPixelSize);
     gl.uniform1f(u["uMaxPx"]!, o.maxPixelSize);
+    gl.uniform1ui(u["uClassHidden"]!, this.classHidden);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.cutTex);
     gl.uniform1i(u["uCut"]!, 0);
@@ -489,6 +521,20 @@ export class PointsSink implements PointSink {
     gl.bindVertexArray(null);
   }
 
+  /** Ver {@link PointCloudView.setHiddenClasses} — aqui é só o uniform. */
+  setClassHidden(mask: number): void {
+    this.classHidden = mask >>> 0;
+  }
+
+  /** Ver {@link PointCloudView.presentClasses}. */
+  get presentClasses(): readonly number[] {
+    const out: number[] = [];
+    for (let code = 0; code < 256; code++) {
+      if (this.classPresent[code] === 1) out.push(code);
+    }
+    return out;
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -498,7 +544,7 @@ export class PointsSink implements PointSink {
     gl.deleteVertexArray(this.emptyVao);
     gl.deleteTexture(this.cutTex);
     gl.deleteTexture(this.liveTex);
-    for (const p of [this.prog, this.pickProg]) gl.deleteProgram(p);
+    if (this.ownsProg) gl.deleteProgram(this.prog);
 
     this.blocks.clear();
     this.alloc.reset();
@@ -553,6 +599,16 @@ function intTexture(gl: WebGL2RenderingContext, fmt: number, w: number, h: numbe
  * fact — and this one is built with the seam already in place.
  */
 export class PointsRasterizer {
+  /**
+   * The point program, linked HERE rather than in the sink.
+   *
+   * `VS`/`FS` are constants, so the program never depended on the cloud — but
+   * it was built in `PointsSink`, which is constructed in `addCloud`, which
+   * runs only after metadata AND hierarchy have landed. Linking it here puts
+   * the compile alongside the network instead of after it, and every cloud
+   * shares the one program.
+   */
+  readonly pointProg: WebGLProgram;
   private readonly edlProg: WebGLProgram;
   private readonly emptyVao: WebGLVertexArrayObject;
   private target: WebGLFramebuffer | null = null;
@@ -571,6 +627,19 @@ export class PointsRasterizer {
   ) {
     this.edlProg = link(gl, VS_POST, FS_EDL, "points-edl");
     this.emptyVao = gl.createVertexArray()!;
+    this.pointProg = link(gl, VS, FS, "points");
+    // WARM IT. `linkProgram` succeeding does not mean the driver has generated
+    // machine code: most defer that to the first draw that uses the program,
+    // and the first draw here is the first frame the user waits for. One
+    // vertex, with colour writes masked off and no attributes bound, forces the
+    // work now — while the hierarchy is still on the wire.
+    gl.colorMask(false, false, false, false);
+    gl.bindVertexArray(this.emptyVao);
+    gl.useProgram(this.pointProg);
+    gl.drawArrays(gl.POINTS, 0, 1);
+    gl.bindVertexArray(null);
+    gl.useProgram(null);
+    gl.colorMask(true, true, true, true);
   }
 
   private get edlOn(): boolean {

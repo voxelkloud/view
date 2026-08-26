@@ -1,5 +1,5 @@
-import type { PerspectiveCamera } from "three/webgpu";
-import { Ray, Vector3 } from "three/webgpu";
+import type { PerspectiveCamera } from "three";
+import { Ray, Vector3 } from "three";
 import { projectionFactorPerspective } from "./lod/metric.js";
 
 export interface PickResult {

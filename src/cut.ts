@@ -20,7 +20,7 @@
 // by LEVEL, not by node, so there is no per-node uniform to hang a start offset
 // on and no per-point lane to spend 4 bytes on. The cost of that choice is the
 // walk length: D steps rather than D - L.
-import { DataTexture, NearestFilter, RGBAFormat, UnsignedByteType } from "three/webgpu";
+import { DataTexture, NearestFilter, RGBAFormat, UnsignedByteType } from "three";
 import type { PointCloudNode } from "@voxelkloud/core";
 
 /**

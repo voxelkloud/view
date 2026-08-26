@@ -1,5 +1,5 @@
 import type { Vec3 } from "@voxelkloud/core";
-import { Group } from "three/webgpu";
+import { Group } from "three";
 
 /**
  * The scene-graph root for one cloud, and the ONE place the coordinate offset

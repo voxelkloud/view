@@ -112,6 +112,21 @@ describe("point material: WGSL emission", () => {
     expect(fragment).toContain("@fragment");
   });
 
+  it("compiles the class-hide mask into the classification fragment only", () => {
+    // O uniform existe em todos os modos (é partilhado), mas o shift+and+discard
+    // só pode aparecer onde o código de classe streama até o fragmento.
+    const cls = compile({ kind: "classification" }).fragment;
+    expect(/>>|shiftRight/.test(cls)).toBe(true);
+    expect(cls).toContain("discard");
+    const rgb = compile({ kind: "rgb" }).fragment;
+    expect(/>>\s/.test(rgb)).toBe(false);
+  });
+
+  it("exposes uClassHidden with nothing hidden by default", () => {
+    const m = createPointMaterial({ colorMode: { kind: "classification" } });
+    expect(m.uClassHidden.value).toBe(0);
+  });
+
   it("does not bind scalarValue for the modes that do not need it", () => {
     expect(compile({ kind: "rgb" }).attributes).not.toContain(
       "scalarValue:float",

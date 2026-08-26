@@ -1,5 +1,5 @@
 import type { DecodedPointData } from "@voxelkloud/format-potree";
-import type { Group, Material } from "three/webgpu";
+import type { Group, Material } from "three";
 import { PointArena } from "./arena.js";
 import type { ArenaBlock, ArenaOptions } from "./arena.js";
 import type { PointReadback, PointSink } from "./sink.js";

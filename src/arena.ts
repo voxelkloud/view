@@ -5,8 +5,8 @@ import {
   Mesh,
   Sphere,
   Vector3,
-} from "three/webgpu";
-import type { Group, Material } from "three/webgpu";
+} from "three";
+import type { Group, Material } from "three";
 import type { PointReadback } from "./sink.js";
 
 /**

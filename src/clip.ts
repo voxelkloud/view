@@ -1,4 +1,4 @@
-import type { Matrix4 } from "three/webgpu";
+import type { Matrix4 } from "three";
 
 /**
  * Force a clip matrix to WebGPU's depth range, in place.

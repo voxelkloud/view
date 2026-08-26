@@ -28,6 +28,7 @@ import {
   shiftRight,
   step,
   texture,
+  uint,
   uniform,
   varyingProperty,
   vec3,
@@ -36,79 +37,19 @@ import {
 } from "three/tsl";
 import { CUT_WIDTH, CUT_WIDTH_SHIFT, MAX_CUT_DEPTH } from "./cut.js";
 
-/**
- * How points are coloured.
- *
- * `intensity` and `classification` read a SCALAR instance attribute rather than
- * vertex colour, which is why they need Task 4's `scalarFormat: "gpu"` lane:
- * three's `_getVertexFormat` has no `Uint8Array` entry at itemSize 1, so a raw
- * uint8 attribute resolves to `undefined` straight into the pipeline descriptor
- * and the device rejects it. The `f32` lane sidesteps that and carries the RAW
- * value — normalisation happens in the shader from the attribute's declared
- * range, so a classification code stays an integer the palette can index.
- */
-export type ColorMode =
-  | { readonly kind: "rgb" }
-  | { readonly kind: "flat"; readonly color: readonly [number, number, number] }
-  | { readonly kind: "elevation" }
-  | { readonly kind: "level" }
-  /** Continuous ramp over the attribute's declared min/max. */
-  | { readonly kind: "intensity" }
-  /** Discrete palette, indexed by the ASPRS class code. */
-  | { readonly kind: "classification" }
-  /**
-   * B5 — distância à malha de projeto, em metros.
-   *
-   * Percorre a MESMA via escalar que `intensity`, e de propósito: a rampa, a
-   * faixa, a legenda e o relatório já a conhecem. A diferença é de onde vem o
-   * número — nenhum arquivo o traz, o kernel de `deviation-wgsl` escreve-o —
-   * e por isso `scalarAttributeFor` não pede atributo nenhum. Pedir um faria a
-   * nuvem ser recusada por não ter um campo que ela não devia ter.
-   */
-  | { readonly kind: "deviation" };
-
-/** The attribute a colour mode needs, or `undefined` for the built-in ones. */
-export function scalarAttributeFor(mode: ColorMode): string | undefined {
-  if (mode.kind === "intensity") return "intensity";
-  if (mode.kind === "classification") return "classification";
-  return undefined;
-}
-
-export interface PointMaterialOptions {
-  readonly colorMode?: ColorMode;
-  /**
-   * Scales the derived world diameter. 1.0 covers with no holes; Potree ships
-   * the equivalent of 0.85, a deliberate 15% under-cover tuned by eye.
-   */
-  readonly sizeMultiplier?: number;
-  /** Device pixels. Below ~1 a splat starts dropping out of rasterisation. */
-  readonly minPixelSize?: number;
-  /**
-   * Device pixels. This is a FILL-RATE control disguised as a taste control: at
-   * 3M points a 2 px mean splat is ~7.6x overdraw at 1080p, 3 px is 17x and
-   * 5 px is 47x.
-   */
-  readonly maxPixelSize?: number;
-  /** CRS units, for the elevation ramp. */
-  readonly elevationRange?: readonly [number, number];
-  /** Declared min/max of the scalar attribute, for the intensity ramp. */
-  readonly scalarRange?: readonly [number, number];
-}
-
-export type ResolvedPointMaterialOptions = Required<PointMaterialOptions>;
-
-export function resolvePointMaterialOptions(
-  o: PointMaterialOptions = {},
-): ResolvedPointMaterialOptions {
-  return {
-    colorMode: o.colorMode ?? { kind: "rgb" },
-    sizeMultiplier: o.sizeMultiplier ?? 1,
-    minPixelSize: o.minPixelSize ?? 1,
-    maxPixelSize: o.maxPixelSize ?? 8,
-    elevationRange: o.elevationRange ?? [0, 1],
-    scalarRange: o.scalarRange ?? [0, 1],
-  };
-}
+// Re-exported, so `./material.js` stays the one import path it always was.
+export type {
+  ColorMode,
+  PointMaterialOptions,
+  ResolvedPointMaterialOptions,
+} from "./material-options.js";
+export { scalarAttributeFor, resolvePointMaterialOptions } from "./material-options.js";
+import type {
+  ColorMode,
+  PointMaterialOptions,
+  ResolvedPointMaterialOptions,
+} from "./material-options.js";
+import { resolvePointMaterialOptions } from "./material-options.js";
 
 /** A `NodeMaterial` with the uniform handles kept reachable for live updates. */
 export interface PointCloudMaterial extends NodeMaterial {
@@ -127,6 +68,13 @@ export interface PointCloudMaterial extends NodeMaterial {
    * `max(depth, level)` clamp, is exactly per-node sizing.
    */
   uCutMap: { value: DataTexture };
+  /**
+   * Bitmask of HIDDEN classes for the classification mode: bit `n` set hides
+   * class `n` for 0..18, and bit 31 hides everything outside the standard
+   * range. Zero — the default — hides nothing. Meaningless in other modes,
+   * where no class code streams at all.
+   */
+  uClassHidden: { value: number };
   /** CLOUD-LOCAL min corner of the root box — the frame `pointOffset` is in. */
   uRootMin: { value: { x: number; y: number; z: number } };
   /** CLOUD-LOCAL extent of the root box, per axis. */
@@ -256,6 +204,7 @@ export function createPointMaterial(
   const uMaxLevel = uniform(1);
   const uScalarMin = uniform(o.scalarRange[0]);
   const uScalarMax = uniform(o.scalarRange[1]);
+  const uClassHidden = uniform(0, "uint");
 
   // Per-object uniforms. `onObjectUpdate` is the same mechanism three uses for
   // `highpModelViewMatrix`; these land in the OBJECT bind group, so they do not
@@ -489,9 +438,23 @@ export function createPointMaterial(
             .div(uScalarMax.sub(uScalarMin).max(1e-9)),
         );
         break;
-      case 'classification':
-        srgb = classificationColor(attribute('scalarValue', 'float'));
+      case 'classification': {
+        const code = attribute('scalarValue', 'float');
+        // Class toggles: one bit per standard code, bit 31 for anything
+        // outside 0..18 — same bucket the UNKNOWN_CLASS colour paints. A
+        // discard, not a zero-size quad: the class only exists in the
+        // fragment stage, where the scalar attribute lands.
+        const bit = code.add(0.5).toInt().clamp(0, 31);
+        const bitU = bit.lessThanEqual(int(18)).select(bit, int(31)).toUint();
+        If(
+          bitAnd(shiftRight(uClassHidden, bitU), uint(1)).equal(uint(1)),
+          () => {
+            Discard();
+          },
+        );
+        srgb = classificationColor(code);
         break;
+      }
       default:
         srgb = attribute('color', 'vec4').xyz;
         break;
@@ -518,6 +481,7 @@ export function createPointMaterial(
     uRootSize,
     uScalarMin,
     uScalarMax,
+    uClassHidden,
     uSizeMultiplier,
     uMinPixelSize,
     uMaxPixelSize,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BlockAllocator } from "./sink-compute.js";
+import { BlockAllocator, MAX_SLOTS, packNodeMeta } from "./sink-compute.js";
 
 /**
  * The allocator behind the compute sink. These are the cases that corrupt
@@ -109,5 +109,60 @@ describe("BlockAllocator", () => {
     expect(a.allocate(60)).toBe(0);
     a.setCapacity(10);
     expect(a.capacity).toBe(100);
+  });
+});
+
+/**
+ * O empacotamento do `nmeta`. Estes são os erros que não lançam nada: uma
+ * classe que invade o slot faz o ponto consultar a liveness de OUTRO nó, e o
+ * sintoma é um nó que some ou pisca — nunca uma exceção, nunca um contador
+ * errado. O shader lê estes mesmos bits em `slotOf` e `classOff`.
+ */
+describe("packNodeMeta", () => {
+  /** O que o WGSL faz: `(nmeta[i] >> 8u) & 0xffffu`. */
+  const slotOf = (v: number) => (v >>> 8) & 0xffff;
+  const levelOf = (v: number) => v & 0xff;
+  const classOf = (v: number) => v >>> 24;
+
+  it("mantém nível, slot e classe sem se pisarem no extremo", () => {
+    // MAX_SLOTS - 1 com a classe mais alta: se o slot ainda ocupasse 24 bits,
+    // a classe entraria nele e este é o caso em que se veria.
+    const meta = packNodeMeta(255, 65_535, 1, [255]);
+    expect(levelOf(meta[0]!)).toBe(255);
+    expect(slotOf(meta[0]!)).toBe(65_535);
+    expect(classOf(meta[0]!)).toBe(255);
+  });
+
+  it("carrega a classe de cada ponto, não a do nó", () => {
+    const meta = packNodeMeta(3, 7, 4, [2, 6, 2, 18]);
+    expect([...meta].map(classOf)).toEqual([2, 6, 2, 18]);
+    expect([...meta].map(slotOf)).toEqual([7, 7, 7, 7]);
+    expect([...meta].map(levelOf)).toEqual([3, 3, 3, 3]);
+  });
+
+  it("deixa a classe em zero quando a nuvem não tem o atributo", () => {
+    const meta = packNodeMeta(1, 2, 3, undefined);
+    expect([...meta].map(classOf)).toEqual([0, 0, 0]);
+    expect([...meta].map(slotOf)).toEqual([2, 2, 2]);
+  });
+
+  it("manda código fora de faixa para o balde 255, não para a classe 0", () => {
+    // 0 é uma classe REAL ("created, never classified"); mandar lixo para lá
+    // faria pontos corrompidos desaparecerem junto com pontos legítimos.
+    const meta = packNodeMeta(0, 0, 3, [-1, 300, 1e9]);
+    expect([...meta].map(classOf)).toEqual([255, 255, 255]);
+  });
+
+  it("reserva exactamente 16 bits ao slot", () => {
+    // A trava da invariante. Subir MAX_SLOTS acima disto faz `slot & 0xffff`
+    // dobrar dois nós no mesmo slot: cada um passa a ler a liveness do outro,
+    // e o sintoma é um nó que pisca — nunca um erro, nunca um contador errado.
+    expect(MAX_SLOTS).toBeLessThanOrEqual(0x1_0000);
+  });
+
+  it("registra só as classes que viu", () => {
+    const present = new Uint8Array(256);
+    packNodeMeta(0, 0, 4, [2, 6, 2, 2], present);
+    expect([...present.keys()].filter((c) => present[c] === 1)).toEqual([2, 6]);
   });
 });

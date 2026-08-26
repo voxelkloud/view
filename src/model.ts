@@ -10,8 +10,8 @@
 // must not pay for it. `packages/react` and `packages/vue` each have a test
 // asserting the same thing about OrbitControls.
 
-import { Group } from "three/webgpu";
-import type { Object3D } from "three/webgpu";
+import { Group } from "three";
+import type { Object3D } from "three";
 
 export interface ModelLayer {
   /**

@@ -16,16 +16,27 @@
  * concordar, e o teste em TypeScript é quem diz.
  */
 export const DEVIATION_WGSL = `
+// A ORDEM AQUI NÃO É ESTÉTICA. Um vec3<f32> em WGSL alinha a 16 bytes, não a
+// 4: com count primeiro, toScene saltaria para o byte 16 e o lado da CPU
+// que escrevesse em sequência acertaria em nada. Foi exatamente o que
+// aconteceu, e o resultado foi um teto de distância com lixo dentro e desvios
+// da ordem de 1e41. Assim o vec3 abre a struct no byte 0, maxDist fecha o
+// vec4 no byte 12, e o count cai num offset que não depende de nada.
 struct U {
-  count     : u32,
   // Nuvem -> cena. Os pontos vivem em coordenadas locais da nuvem e a BVH em
   // coordenadas de cena; somar aqui é mais barato que reconstruir a árvore.
-  toScene   : vec3<f32>,
+  toScene   : vec3<f32>,   // 0..11
   // Acima disto o ponto não interessa: um telhado a 40 m do modelo não é um
   // desvio, é outro prédio. Corta a travessia cedo e limita a rampa.
-  maxDist   : f32,
-  _pad      : vec3<f32>,
+  maxDist   : f32,         // 12..15
+  count     : u32,         // 16..19
 };
+// Sem campo de padding: a struct alinha a 16 por causa do vec3, logo o tamanho
+// já arredonda de 20 para 32 sozinho. O _pad de vec3<u32> que aqui esteve fazia
+// o OPOSTO do que o nome promete — vec3 alinha a 16, ele saltava para o byte 32
+// e esticava a struct para 48. A GPU disse isso em texto claro ("bound with
+// size 32 ... requires at least 48") e eu estava a filtrar o console estreito
+// demais para ler.
 
 @group(0) @binding(0) var<storage, read>       pos   : array<f32>;
 @group(0) @binding(1) var<storage, read_write> col   : array<u32>;
@@ -45,7 +56,7 @@ fn boxDistSq(p : vec3<f32>, lo : vec3<f32>, hi : vec3<f32>) -> f32 {
   return dot(d, d);
 }
 
-/** As sete regiões de Voronoi do triângulo. Espelha \`pointTriangleDistanceSq\`. */
+/** As sete regiões de Voronoi do triângulo. Espelha pointTriangleDistanceSq. */
 fn triDistSq(p : vec3<f32>, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>) -> f32 {
   let ab = b - a;
   let ac = c - a;
