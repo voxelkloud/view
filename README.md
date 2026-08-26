@@ -31,6 +31,24 @@ tick();
 `view.camera` and `view.scene` are the three objects, so OrbitControls and every
 other add-on attach normally.
 
+### A cloud you can point it at right now
+
+```ts
+const url = "https://s3.amazonaws.com/hobu-lidar/autzen-classified.copc.laz";
+```
+
+One COPC file on a bucket that is not ours, read by HTTP Range with no
+conversion step and nothing downloaded whole. Verified from a browser rather
+than assumed: it answers the CORS preflight for a ranged `GET` with
+`Access-Control-Allow-Headers: range`, which is the part most public buckets
+get wrong.
+
+USGS 3DEP is the obvious bigger example — the whole United States, as EPT, and
+genuinely public. It does not work from a page: plain `GET`s succeed, and the
+preflight for a ranged one returns **403**. `curl` will tell you the data is
+fine and the browser will still refuse it, so check the preflight before
+promising anyone a dataset.
+
 ## Three rasterisers
 
 `sinkMode` picks how points reach the screen. The default is `"auto"`, which

@@ -1145,6 +1145,68 @@ export class PointCloudView {
     this.dirty = true;
   }
 
+  /**
+   * A união das bordas de TODAS as nuvens, em coordenadas de cena.
+   *
+   * `undefined` quando não há nenhuma. Todas partilham a origem de cena — a
+   * primeira a abrir define-a e as seguintes herdam-na — logo a união é uma
+   * subtração e não uma mudança de referencial por nuvem.
+   */
+  private allCloudsBox():
+    | { min: [number, number, number]; max: [number, number, number] }
+    | undefined {
+    if (this.clouds.length === 0) return undefined;
+    const o = this.clouds[0]!.object.getSceneOrigin();
+    const min: [number, number, number] = [Infinity, Infinity, Infinity];
+    const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    for (const h of this.clouds) {
+      const b = h.source.tightBoundingBox;
+      for (let i = 0; i < 3; i++) {
+        min[i] = Math.min(min[i]!, b.min[i]! - o[i]!);
+        max[i] = Math.max(max[i]!, b.max[i]! - o[i]!);
+      }
+    }
+    return { min, max };
+  }
+
+  /**
+   * Enquadrar TODAS as nuvens de uma vez.
+   *
+   * Existe à parte de {@link frameCloud} porque um projeto de vários ladrilhos
+   * abre em todos eles: enquadrar o primeiro deixaria os vizinhos fora do ecrã
+   * e a pessoa a arrastar à procura do resto do levantamento.
+   */
+  frameClouds(): void {
+    const b = this.allCloudsBox();
+    if (b === undefined) return;
+    const cx = (b.min[0] + b.max[0]) / 2;
+    const cy = (b.min[1] + b.max[1]) / 2;
+    const cz = (b.min[2] + b.max[2]) / 2;
+    const span = Math.max(
+      b.max[0] - b.min[0],
+      b.max[1] - b.min[1],
+      b.max[2] - b.min[2],
+    );
+    const d = span * 0.9;
+    this.camera.position.set(cx + d, cy - d, cz + d * 0.6);
+    this.camera.lookAt(cx, cy, cz);
+    this.camera.near = Math.max(span / 5000, 0.1);
+    this.camera.far = span * 20;
+    this.camera.updateProjectionMatrix();
+    this.dirty = true;
+  }
+
+  /** Onde {@link frameClouds} aponta — o alvo de órbita com várias nuvens. */
+  targetForClouds(): Vector3 {
+    const b = this.allCloudsBox();
+    if (b === undefined) return new Vector3();
+    return new Vector3(
+      (b.min[0] + b.max[0]) / 2,
+      (b.min[1] + b.max[1]) / 2,
+      (b.min[2] + b.max[2]) / 2,
+    );
+  }
+
   /** Where `frameCloud` aims — the orbit target for controls. */
   targetFor(index = 0): Vector3 {
     const h = this.clouds[index];

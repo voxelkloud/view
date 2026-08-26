@@ -76,3 +76,62 @@ describe("setClipPlanes targeting", () => {
     expect(seen.points).toEqual([undefined, undefined]);
   });
 });
+
+/**
+ * A união que {@link PointCloudView.frameClouds} enquadra.
+ *
+ * A falha que isto tranca não lança nada: enquadrar só a primeira nuvem deixa
+ * os ladrilhos vizinhos fora do ecrã, e a pessoa arrasta à procura de dados que
+ * pensa que não carregaram. Todas as nuvens partilham a origem de cena da
+ * primeira, e é essa subtração que se verifica aqui.
+ */
+describe("targetForClouds", () => {
+  function viewWithClouds(
+    boxes: { min: [number, number, number]; max: [number, number, number] }[],
+    origin: [number, number, number],
+  ) {
+    const canvas = {
+      getContext: () => null,
+      addEventListener() {},
+      removeEventListener() {},
+      width: 100,
+      height: 100,
+      style: {},
+      clientWidth: 100,
+      clientHeight: 100,
+    } as unknown as HTMLCanvasElement;
+    const view = new PointCloudView({ canvas });
+    (view as unknown as { clouds: unknown[] }).clouds.push(
+      ...boxes.map((b) => ({
+        source: { tightBoundingBox: b },
+        object: { getSceneOrigin: () => origin },
+      })),
+    );
+    return view;
+  }
+
+  it("centra no conjunto, não na primeira", () => {
+    const view = viewWithClouds(
+      [
+        { min: [0, 0, 0], max: [10, 10, 10] },
+        { min: [90, 0, 0], max: [100, 10, 10] },
+      ],
+      [0, 0, 0],
+    );
+    const t = view.targetForClouds();
+    // 50 e não 5: a primeira nuvem sozinha daria 5, e é esse o erro.
+    expect(t.x).toBe(50);
+    expect(t.y).toBe(5);
+  });
+
+  it("subtrai a origem de cena partilhada", () => {
+    const view = viewWithClouds([{ min: [1000, 2000, 0], max: [1010, 2010, 4] }], [1000, 2000, 0]);
+    const t = view.targetForClouds();
+    expect([t.x, t.y, t.z]).toEqual([5, 5, 2]);
+  });
+
+  it("devolve a origem quando não há nuvem nenhuma", () => {
+    const view = viewWithClouds([], [0, 0, 0]);
+    expect(view.targetForClouds().lengthSq()).toBe(0);
+  });
+});
