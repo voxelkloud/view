@@ -33,6 +33,9 @@ other add-on attach normally.
 
 ### A cloud you can point it at right now
 
+[**Open it running →**](https://voxelkloud.github.io/example/)
+
+
 ```ts
 const url = "https://s3.amazonaws.com/hobu-lidar/autzen-classified.copc.laz";
 ```
