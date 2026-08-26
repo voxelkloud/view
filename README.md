@@ -171,6 +171,61 @@ it was met and the bonus tier hit the withheld slice; `"budget"` and `"nodes"`
 mean the target was NOT met and quality is being left on the table. Read it with
 `stats.achievedScreenError`, the worst projected error still on screen.
 
+### When it goes wrong, it does not throw
+
+The failures that matter here are silent. A GPU that goes away, a shader that
+fails validation, a pipeline the driver rejects — none of them raise an
+exception. The device keeps accepting calls, every submit is dropped, the canvas
+stops changing, and the console stays empty. From outside that is
+indistinguishable from a camera pointed at nothing, which is what makes "it went
+black" such a hard report to act on.
+
+```ts
+const view = createPointCloudView({
+  canvas,
+  onDeviceLost: (info) => {
+    // `reason` is the browser's own, verbatim. There is nothing to recover —
+    // every buffer went with the device — but there is everything to say.
+    console.error(`GPU lost after ${info.afterSeconds}s: ${info.reason}`);
+  },
+});
+await view.init();
+
+view.adapterInfo;   // { vendor: "amd", architecture: "rdna-1", … } or undefined
+view.gpuErrors;     // uncaptured validation errors, in order
+view.gpuWarnings;   // shader messages that were NOT errors
+view.deviceLost;    // set once, never cleared
+```
+
+`adapterInfo` is what turns a report into something actionable: the same code is
+fine on one vendor's driver and blank on another, and without it every report
+reads identically.
+
+`gpuWarnings` exists because a module that compiles with warnings still runs.
+`createShaderModule` never rejects and `getCompilationInfo` is async, so a
+module that warned looks exactly like one that compiled clean — right up until a
+driver treats the warning as fatal. On the WebGL 2 path the same array collects
+`getShaderInfoLog` from programs that linked *successfully*, which is the only
+warning channel that API has.
+
+`renderFrame()` returns `false` once the device is gone, rather than reporting
+sixty successful frames a second onto a dead canvas.
+
+### Subpath exports
+
+Two values live off the package root, because building them needs
+`three/webgpu` — three's WebGPU bundle, 357 kB gzipped against 115 kB for the
+core — and a root export made that edge static for every consumer, including
+the ones that render through raw WebGL 2 and never touch it:
+
+```ts
+import { createPointMaterial } from "@voxelkloud/view/material";
+import { createEdlPipeline, resolveEdlOptions } from "@voxelkloud/view/edl";
+```
+
+Every type stays on the root, and so do `resolvePointMaterialOptions` and
+`scalarAttributeFor`, which are arithmetic and always were.
+
 ### What a dataset costs, and why there is a budget at all
 
 An octree is self-similar by construction: one box becomes eight, each with half
