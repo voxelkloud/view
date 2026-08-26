@@ -236,6 +236,15 @@ export function pointDecodeSelection(
  */
 export type ClipTarget = "all" | "model";
 
+/** What the browser says it is drawing on. Every field is optional because
+ *  `GPUAdapter.info` is, and a missing field is more useful than a guessed one. */
+export interface GpuAdapterInfo {
+  readonly vendor?: string;
+  readonly architecture?: string;
+  readonly device?: string;
+  readonly description?: string;
+}
+
 /** Why the GPU device died. `reason` is the browser's, verbatim. */
 export interface DeviceLostInfo {
   readonly reason: string;
@@ -690,6 +699,23 @@ export class PointCloudView {
   }
   /** First few uncaptured GPU errors, in order. Validation failures land here. */
   readonly gpuErrors: string[] = [];
+  /**
+   * Shader compilation messages that were NOT errors.
+   *
+   * A module that compiles with warnings still runs, and on some drivers what
+   * warns here is what draws nothing there. They are worth collecting for the
+   * same reason the errors are: nothing about them throws.
+   */
+  readonly gpuWarnings: string[] = [];
+  /**
+   * Which GPU won. Undefined until `init`, and on any browser whose adapter
+   * declines to say.
+   *
+   * This is the field that turns "it went black on my machine" into something
+   * actionable: the same code is fine on one vendor's driver and not another's,
+   * and without this every report is indistinguishable.
+   */
+  adapterInfo: GpuAdapterInfo | undefined;
   private readonly bornAt = typeof performance !== "undefined" ? performance.now() : 0;
   /** The device and swapchain the compute path draws into. Ours, not three's. */
   private device: GPUDevice | undefined;
@@ -779,6 +805,19 @@ export class PointCloudView {
             maxBufferSize: adapter.limits.maxBufferSize,
           },
         });
+        if (adapter !== null && adapter !== undefined) {
+          // `info` is a plain object on Chrome and absent elsewhere; spread
+          // rather than keep the adapter, which should not outlive this scope.
+          const i = (adapter as unknown as { info?: GpuAdapterInfo }).info;
+          if (i !== undefined) {
+            this.adapterInfo = {
+              ...(i.vendor !== undefined ? { vendor: i.vendor } : {}),
+              ...(i.architecture !== undefined ? { architecture: i.architecture } : {}),
+              ...(i.device !== undefined ? { device: i.device } : {}),
+              ...(i.description !== undefined ? { description: i.description } : {}),
+            };
+          }
+        }
         if (device !== undefined) {
           // The context is claimed LAST, and only once the device is in hand: a
           // canvas gives out one context type for its lifetime, so claiming
@@ -812,6 +851,7 @@ export class PointCloudView {
             });
             this.raster = new ComputeRasterizer(device, ctx, format, {
               background: bg,
+              warnings: this.gpuWarnings,
               ...edlOpts,
             });
             this.rasterizer = "compute";
@@ -844,7 +884,11 @@ export class PointCloudView {
         powerPreference: "high-performance",
       }) as WebGL2RenderingContext | null;
       if (gl !== null) {
-        this.pointsRaster = new PointsRasterizer(gl, { background: bg, ...edlOpts });
+        this.pointsRaster = new PointsRasterizer(gl, {
+          background: bg,
+          warnings: this.gpuWarnings,
+          ...edlOpts,
+        });
         this.gl = gl;
         this.rasterizer = "points";
         this.depthRange = "minus-one-to-one";

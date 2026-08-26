@@ -551,7 +551,38 @@ export class PointsSink implements PointSink {
   }
 }
 
-function link(gl: WebGL2RenderingContext, vs: string, fs: string, label: string): WebGLProgram {
+/**
+ * Non-fatal GL shader messages, drained into a shared array.
+ *
+ * `getShaderInfoLog` is not only for failures: a shader that compiles and
+ * links can still carry a driver note, and on WebGL that note is the only
+ * warning channel there is. It is also where "compiled fine here, black there"
+ * usually leaves its fingerprint.
+ */
+function collectGlMessages(
+  gl: WebGL2RenderingContext,
+  prog: WebGLProgram,
+  shaders: readonly WebGLShader[],
+  label: string,
+  into: string[] | undefined,
+): void {
+  if (into === undefined) return;
+  const push = (what: string, log: string | null): void => {
+    const text = (log ?? "").trim();
+    if (text === "" || into.length >= 24) return;
+    into.push(`${label}/${what}: ${text.slice(0, 300)}`);
+  };
+  for (const sh of shaders) push("shader", gl.getShaderInfoLog(sh));
+  push("link", gl.getProgramInfoLog(prog));
+}
+
+function link(
+  gl: WebGL2RenderingContext,
+  vs: string,
+  fs: string,
+  label: string,
+  warnings?: string[],
+): WebGLProgram {
   const compile = (type: number, src: string): WebGLShader => {
     const sh = gl.createShader(type)!;
     gl.shaderSource(sh, src);
@@ -562,12 +593,15 @@ function link(gl: WebGL2RenderingContext, vs: string, fs: string, label: string)
     return sh;
   };
   const prog = gl.createProgram()!;
-  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
-  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+  const shv = compile(gl.VERTEX_SHADER, vs);
+  const shf = compile(gl.FRAGMENT_SHADER, fs);
+  gl.attachShader(prog, shv);
+  gl.attachShader(prog, shf);
   gl.linkProgram(prog);
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
     throw new Error(`${label} link: ${gl.getProgramInfoLog(prog) ?? "?"}`);
   }
+  collectGlMessages(gl, prog, [shv, shf], label, warnings);
   return prog;
 }
 
@@ -623,11 +657,13 @@ export class PointsRasterizer {
     private readonly options: {
       readonly background: readonly [number, number, number];
       readonly edl?: { readonly strength: number; readonly radius: number } | undefined;
+      /** Where non-fatal shader messages go. Shared with the view. */
+      readonly warnings?: string[] | undefined;
     },
   ) {
-    this.edlProg = link(gl, VS_POST, FS_EDL, "points-edl");
+    this.edlProg = link(gl, VS_POST, FS_EDL, "points-edl", options.warnings);
     this.emptyVao = gl.createVertexArray()!;
-    this.pointProg = link(gl, VS, FS, "points");
+    this.pointProg = link(gl, VS, FS, "points", options.warnings);
     // WARM IT. `linkProgram` succeeding does not mean the driver has generated
     // machine code: most defer that to the first draw that uses the program,
     // and the first draw here is the first frame the user waits for. One

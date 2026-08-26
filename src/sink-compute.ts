@@ -93,6 +93,35 @@ function narrowColors(src: ArrayLike<number> | undefined): Uint8Array | undefine
 /** Depth format for the overlay attachment. 24-bit plus stencil is universal. */
 export const OVERLAY_DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
 
+/**
+ * Shader messages that are NOT errors, drained into a shared array.
+ *
+ * `createShaderModule` never rejects and `getCompilationInfo` is async, so a
+ * module that compiled with warnings looks exactly like one that compiled
+ * clean — right up until a driver that treats the warning as fatal draws
+ * nothing. Fire-and-forget: nothing here should delay a frame.
+ */
+function collectShaderMessages(
+  module: GPUShaderModule,
+  label: string,
+  into: string[] | undefined,
+): void {
+  if (into === undefined) return;
+  void module
+    .getCompilationInfo()
+    .then((info) => {
+      for (const m of info.messages) {
+        // Errors already travel through `uncapturederror`; duplicating them
+        // here would spend an event budget twice on one fault.
+        if (m.type === "error" || into.length >= 24) continue;
+        into.push(`${label}:${m.lineNum}:${m.linePos} ${m.type}: ${m.message}`);
+      }
+    })
+    .catch(() => {
+      /* A browser without compilation info is not a failure worth reporting. */
+    });
+}
+
 export class ComputeRasterizer {
   private depthBuf: GPUBuffer | undefined;
   /**
@@ -128,9 +157,12 @@ export class ComputeRasterizer {
     private readonly options: {
       readonly background: readonly [number, number, number];
       readonly edl?: { readonly strength: number; readonly radius: number } | undefined;
+      /** Where non-error shader messages go. Shared with the view. */
+      readonly warnings?: string[] | undefined;
     },
   ) {
     this.module = device.createShaderModule({ code: COMPUTE_WGSL, label: "voxelkloud-compute" });
+    collectShaderMessages(this.module, "compute", options.warnings);
     this.uniBuf = device.createBuffer({
       size: UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

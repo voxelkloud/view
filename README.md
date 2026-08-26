@@ -171,6 +171,65 @@ it was met and the bonus tier hit the withheld slice; `"budget"` and `"nodes"`
 mean the target was NOT met and quality is being left on the table. Read it with
 `stats.achievedScreenError`, the worst projected error still on screen.
 
+### What a dataset costs, and why there is a budget at all
+
+An octree is self-similar by construction: one box becomes eight, each with half
+the edge, and every LOD quantity is the root's divided by `2 ** level` —
+`boundingRadiusAt(L) === boundingRadiusAt(0) / 2 ** L`, and the same for point
+spacing. That is why the scheduler can work from the level alone on every octree
+format, and why `nodeGeometricError` exists for the formats where it cannot.
+
+What is NOT self-similar is which of those boxes have anything in them, and that
+is the number that decides what a cloud costs you. Counting occupied nodes per
+level IS box counting, so the growth ratio between levels is a
+Minkowski–Bouligand dimension of whatever was scanned. Measured by walking
+`hierarchy.bin` over every Potree v2 set in `demo/data`, each walk summing to the
+declared point count:
+
+| dataset | points | occupied nodes per level | D |
+| --- | --- | --- | --- |
+| autzen | 10.6M | 4.00 3.00 4.00 4.00 4.22 4.03 | **1.95** |
+| large-20m | 20.0M | 4.00 5.50 3.55 5.12 3.84 3.26 | **2.05** |
+| large-50m | 50.7M | 4.00 6.75 4.00 3.76 4.03 3.98 | **1.97** |
+| large-100m | 100.5M | 4.00 4.00 3.62 2.97 4.40 4.19 3.80 | **1.84** |
+
+Every one of them is a surface. `D = 2` means a level down quadruples the
+occupied nodes; a filled volume would be `D = 3` and 8x, and vegetation sits
+between the two because foliage really does carry detail at every scale. Each
+tree's last level is excluded from `D` — it is the converter's truncation tail,
+not a scaling regime. autzen's is 40 nodes against level 6's 3269.
+
+Two consequences a caller feels:
+
+**A level down costs ~4x the points and buys 2x the sharpness.** Spacing halves,
+occupancy quadruples. Quadratic cost, linear gain — which is why
+`targetScreenError` is denominated in device pixels rather than in levels, and
+why `pointBudget` is a ceiling rather than a suggestion.
+
+**Three quarters of the tree is its deepest full level.** That is what a 4x ratio
+means, and autzen measures it: 3269 nodes of 4377. Almost every refinement
+decision the scheduler makes is happening on the frontier, which is also why
+`budgetHeadroom` withholds its slice there rather than anywhere else.
+
+The stress sets (`rotterdam`, `dublin`) exist because they are NOT this — 240 m
+of verticality across the Wilhelminapier towers gives an octree that is genuinely
+3D rather than a draped sheet. They are COPC, so they are not in the table above,
+and `D > 2` for them is an expectation, not a measurement.
+
+#### The depth cap is float32, not taste
+
+`MAX_CUT_DEPTH` is 20. The vertex-stage walk halves a cloud-local box `depth`
+times and compares a point offset against its centre, so the comparison stops
+meaning anything once a cell is the size of a float32 ULP. At autzen's 4655 m
+root extent the ULP near the far corner is 4.9e-4 m and a level-20 cell is
+4.4e-3 m — 9x of margin. A level-23 cell is 5.5e-4 m, and there is none left.
+
+No stock converter comes close. autzen reaches level 7 and the 100M set reaches
+9, so the cap sits about a thousandfold in linear extent away from binding. It
+binds for a cloud whose root extent is very large against its finest spacing — a
+continental tile at millimetre pitch — and it fails as splat sizing going wrong
+in the deepest nodes, not as an error.
+
 ### `@voxelkloud/view/lod`
 
 The scheduler on its own — frustum extraction, AABB classification, the
