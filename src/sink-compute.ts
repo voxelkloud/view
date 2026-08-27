@@ -400,11 +400,14 @@ export const MAX_SLOTS = 65_536;
 // 256 e não 192 desde a DEC-B6: os quatro planos de corte precisam de
 // alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Depois
 // veio a faixa de altura, um vec2 que só cabia DEPOIS do array de planos, e o
-// struct fecha em 272. Manter este número em sincronia com o `struct U` do
+// struct fecha em 272. Depois veio a camera da foto, uma mat4x4 que exige
+// alinhamento de 16 e cai exactamente em 272 sem mexer em nada do que ja la
+// estava, mais o seu peso de mistura: o struct fecha em 352. Manter este
+// número em sincronia com o `struct U` do
 // WGSL é obrigatório — um uniform mais curto que o struct dá layout inválido, e
 // o cabeçalho de `compute-wgsl` avisa que isso NÃO lança: os passes silenciam e
 // a tela fica preta com todos os contadores da CPU corretos.
-const UNIFORM_BYTES = 272;
+const UNIFORM_BYTES = 352;
 
 /**
  * Faixa de altura DESLIGADA.
@@ -540,6 +543,21 @@ export class ComputeSink implements PointSink {
   private zLo = Z_RANGE_OFF[0];
   private zHi = Z_RANGE_OFF[1];
   /**
+   * A foto projetada sobre a nuvem, e a matriz que a projeta.
+   *
+   * `photoTex` a `undefined` quer dizer sem foto, e ai o binding leva a
+   * `blankTex`: o WebGPU exige uma entrada por binding do layout, entao "sem
+   * foto" tem de ser uma textura real. E 1x1 e nunca e lida, porque `photoMix`
+   * a zero sai da funcao antes de amostrar.
+   */
+  private photoTex: GPUTexture | undefined;
+  /** A imagem que `photoTex` carrega, para nao reenviar a mesma. */
+  private photoImage: ImageBitmap | undefined;
+  private readonly photoSamp: GPUSampler;
+  private readonly blankTex: GPUTexture;
+  private photoMix = 0;
+  private readonly photoMatrix = new Float32Array(16);
+  /**
    * Que códigos ASPRS esta nuvem realmente contém, um flag por código.
    *
    * Acumulado no `attach`, que já percorre todo ponto para empacotar a classe,
@@ -591,6 +609,21 @@ export class ComputeSink implements PointSink {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    // O sampler e a textura vazia da projecao. Criados sempre, e nao a pedido:
+    // o bind group precisa deles em todo frame, com ou sem foto, e um branch
+    // por frame no caminho quente para poupar quatro bytes de textura nao paga.
+    this.photoSamp = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    });
+    this.blankTex = device.createTexture({
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+
     const ro = { type: "read-only-storage" } as const;
     const rw = { type: "storage" } as const;
     const C = GPUShaderStage.COMPUTE;
@@ -608,6 +641,11 @@ export class ComputeSink implements PointSink {
         { binding: 6, visibility: C, buffer: ro },
         { binding: 7, visibility: C, buffer: ro },
         { binding: 8, visibility: C, buffer: ro },
+        // A foto projetada. Tipos DIFERENTES de storage buffer, e e por isso
+        // que cabem: o shader esta exactamente nos 8 buffers que o WebGPU
+        // garante, e uma textura amostrada conta noutro limite, de 16.
+        { binding: 9, visibility: C, texture: { sampleType: "float" as const } },
+        { binding: 10, visibility: C, sampler: { type: "filtering" as const } },
       ],
     });
     const pl = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
@@ -980,6 +1018,8 @@ export class ComputeSink implements PointSink {
         { binding: 6, resource: { buffer: this.metaBuf } },
         { binding: 7, resource: { buffer: this.cutBuf } },
         { binding: 8, resource: { buffer: this.liveBuf } },
+        { binding: 9, resource: (this.photoTex ?? this.blankTex).createView() },
+        { binding: 10, resource: this.photoSamp },
       ],
     });
     this.bindStale = false;
@@ -1006,6 +1046,45 @@ export class ComputeSink implements PointSink {
   setZRange(lo: number, hi: number): void {
     this.zLo = lo;
     this.zHi = hi;
+  }
+
+  /**
+   * Ver {@link PointCloudView.setPhoto} — aqui e o upload e o uniform.
+   *
+   * A textura so sobe quando a IMAGEM muda, e nao quando a matriz muda: virar
+   * a camera reescreve dezasseis floats, e reenviar doze megapixels a cada
+   * frame de orbita e a diferenca entre isto ser utilizavel e nao ser.
+   */
+  setPhoto(
+    image: ImageBitmap | undefined,
+    clipFromCloud: Float32Array | undefined,
+    mix: number,
+  ): void {
+    this.photoMix = mix;
+    if (clipFromCloud !== undefined && clipFromCloud.length === 16)
+      this.photoMatrix.set(clipFromCloud);
+    if (image === this.photoImage) return;
+    this.photoImage = image;
+    this.photoTex?.destroy();
+    this.photoTex = undefined;
+    if (image !== undefined) {
+      this.photoTex = this.device.createTexture({
+        size: [image.width, image.height],
+        format: "rgba8unorm",
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.device.queue.copyExternalImageToTexture(
+        { source: image },
+        { texture: this.photoTex },
+        [image.width, image.height],
+      );
+    }
+    // O bind group aponta para a textura ANTIGA, que acabou de ser destruida.
+    // Sem isto o proximo frame amostra um recurso morto.
+    this.bindStale = true;
   }
 
   /**
@@ -1082,6 +1161,10 @@ export class ComputeSink implements PointSink {
     // {@link UNIFORM_BYTES} — foi por causa destes dois que ele cresceu.
     this.uf[64] = this.zLo;
     this.uf[65] = this.zHi;
+    // Words 68..84: a camera da foto. 68 e multiplo de 4, que e o alinhamento
+    // que uma mat4x4 exige -- por isso ela entrou aqui sem deslocar nada.
+    this.uf.set(this.photoMatrix, 68);
+    this.uf[84] = this.photoTex === undefined ? 0 : this.photoMix;
     const e = modelMatrix.elements;
     for (let i = 0; i < nPlanes; i++) {
       const nx = planes![i * 4]!;
@@ -1113,6 +1196,8 @@ export class ComputeSink implements PointSink {
     this.devUniform?.destroy();
     if (this.disposed) return;
     this.disposed = true;
+    this.photoTex?.destroy();
+    this.blankTex.destroy();
     for (const b of [
       this.posBuf,
       this.colBuf,

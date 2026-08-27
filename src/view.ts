@@ -1685,6 +1685,62 @@ export class PointCloudView {
   }
 
   /**
+   * Projeta uma foto sobre a cena — textura projetiva, e nao uma imagem por cima.
+   *
+   * `clipFromScene` leva um ponto de CENA ao espaco de recorte da camera que
+   * tirou a foto; quem a constroi e quem sabe a pose. Cada ponto pergunta que
+   * pixel o fotografou, entao a foto assenta no relevo REAL em vez de num plano,
+   * e como a cor passa a viver no ponto ela e oclusa pela nuvem e orbita como
+   * geometria. Uma imagem em DOM por cima da tela nunca podia fazer nenhuma das
+   * duas coisas, e era por isso que parecia flutuar.
+   *
+   * `undefined` desliga. `opacity` mistura com a cor que o modo ja dava, entao
+   * meio caminho mostra foto e nuvem ao mesmo tempo — que e como se confere
+   * alinhamento.
+   *
+   * VALE PARA A CENA, nao para uma nuvem: uma foto aerea cobre o que estiver
+   * debaixo dela, e num projeto com varias nuvens escolher uma seria arbitrario.
+   * Cada nuvem converte a matriz para o seu proprio referencial.
+   *
+   * O braco de material instanciado NAO desenha isto. Ele e o ultimo recurso
+   * para quem nao tem WebGPU nem os pontos em WebGL 2, e uma feature que exige
+   * amostrar textura por ponto nao lhe pertence.
+   */
+  setPhoto(
+    photo:
+      | {
+          readonly image: ImageBitmap;
+          readonly clipFromScene: Float32Array | Float64Array;
+          readonly opacity?: number;
+        }
+      | undefined,
+  ): void {
+    const mix = photo === undefined ? 0 : (photo.opacity ?? 1);
+    for (const h of this.clouds) {
+      if (h === undefined) continue;
+      let m: Float32Array | undefined;
+      if (photo !== undefined && photo.clipFromScene.length === 16) {
+        // De cena para local-da-nuvem e uma TRANSLACAO, entao a composicao
+        // mexe so na quarta coluna: M * T(d) deixa a rotacao onde estava e
+        // soma d ja projetado. Sem inversa, sem transposta.
+        const o = h.object.cloudOrigin;
+        const so = h.object.getSceneOrigin();
+        const dx = o[0] - so[0];
+        const dy = o[1] - so[1];
+        const dz = o[2] - so[2];
+        const c = photo.clipFromScene;
+        m = new Float32Array(16);
+        for (let i = 0; i < 12; i++) m[i] = c[i]!;
+        for (let r = 0; r < 4; r++)
+          m[12 + r] = c[r]! * dx + c[4 + r]! * dy + c[8 + r]! * dz + c[12 + r]!;
+      }
+      h.computeSink?.setPhoto(photo?.image, m, mix);
+      h.pointsSink?.setPhoto(photo?.image, m, mix);
+    }
+    this.dirty = true;
+  }
+
+  /**
    * Uma faixa de altura de partida que descarta o rabo, em unidades de cena.
    *
    * Os mesmos 0,2% de cada ponta que {@link groundZ} usa para achar o chão, e

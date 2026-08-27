@@ -52,6 +52,19 @@ struct U {
   // de planos, e não num padding no meio: os offsets de tudo o que já existia
   // ficam onde estavam, e o custo é um vec4 a mais no buffer.
   zRange    : vec2<f32>,
+  // A camera da FOTO, em coordenadas LOCAIS DA NUVEM: leva um ponto ao espaco
+  // de recorte dela, e e o que substitui a homografia em CSS.
+  //
+  // A diferenca e o pressuposto que cai. A homografia rebatia a imagem sobre UM
+  // plano, entao todo o relevo virava desalinhamento e a foto parecia flutuar;
+  // aqui cada ponto pergunta que pixel o fotografou, na geometria que ele
+  // realmente tem. Entra DEPOIS do array de planos e da faixa de altura, pela
+  // mesma razao que elas: os offsets de tudo o que ja existia ficam onde estao.
+  photoClipFromCloud : mat4x4<f32>,
+  // Quanto da foto entra na cor, 0..1. ZERO DESLIGA -- e o teste que o caso
+  // comum paga, em vez de um bind group diferente por causa de uma feature que
+  // a maioria das cenas nao usa.
+  photoMix  : f32,
 };
 
 @group(0) @binding(0) var<storage, read>       pos   : array<f32>;
@@ -70,6 +83,17 @@ struct U {
 @group(0) @binding(7) var<storage, read>       cut   : array<u32>;
 // Whether each node is in THIS frame's draw list, indexed by the slot in nmeta.
 @group(0) @binding(8) var<storage, read>       live  : array<u32>;
+
+// A foto e o seu sampler. NAO sao storage buffers: o limite que este shader ja
+// toca -- 'maxStorageBuffersPerShaderStage', garantido em 8 e onde ele esta
+// exactamente -- conta so buffers. Texturas amostradas tem limite proprio, de
+// 16, entao isto cabe sem tirar nada de la.
+//
+// Existem SEMPRE, mesmo sem foto: o WebGPU exige uma entrada por binding do
+// layout, e sem foto o que esta ligado e uma textura 1x1 que 'photoMix' a zero
+// nunca chega a ler.
+@group(0) @binding(9)  var photoTex  : texture_2d<f32>;
+@group(0) @binding(10) var photoSamp : sampler;
 
 const RAMP = array<vec3<f32>, 5>(
   vec3<f32>(0.19, 0.07, 0.23), vec3<f32>(0.21, 0.36, 0.55), vec3<f32>(0.13, 0.57, 0.55),
@@ -255,7 +279,7 @@ fn project(i : u32) -> Splat {
 // No sRGB->linear conversion, unlike that material: it renders through three
 // into a linear working space and back out, while this writes straight to a
 // non-sRGB swapchain, so converting here would decode twice.
-fn shade(i : u32, z : f32) -> vec3<f32> {
+fn baseShade(i : u32, z : f32) -> vec3<f32> {
   switch u.mode {
     case 1u: { return u.flatColor; }
     case 2u: { return rampAt((z - u.elevMin) / max(u.elevMax - u.elevMin, 1e-9)); }
@@ -273,6 +297,43 @@ fn shade(i : u32, z : f32) -> vec3<f32> {
       return vec3<f32>(f32(rgba & 0xffu), f32((rgba >> 8u) & 0xffu), f32((rgba >> 16u) & 0xffu)) / 255.0;
     }
   }
+}
+
+/**
+ * A cor com a foto projetada por cima, quando ha uma.
+ *
+ * Isto e textura projetiva: o ponto vai ao espaco de recorte da camera da foto
+ * e le o pixel que o fotografou. Nao ha plano nenhum no meio, entao o relevo
+ * deixa de ser erro -- e como a cor vive no ponto, a foto passa a ser oclusa
+ * pela nuvem e a orbitar como geometria, que era o que a imagem em DOM por
+ * cima da tela nunca podia fazer.
+ *
+ * O QUE ISTO AINDA NAO FAZ e o teste de profundidade a partir da foto. Um
+ * projetor ilumina tudo o que esta na sua frente, inclusive o que estava
+ * ESCONDIDO atras de um telhado: essa parede recebe textura que a lente nunca
+ * viu. Num voo a nadir sobre terreno o efeito e pequeno e aparece nas faces
+ * verticais; a correccao e um mapa de profundidade da foto, um passe a mais.
+ */
+fn photoOver(i : u32, base : vec3<f32>) -> vec3<f32> {
+  if (u.photoMix <= 0.0) { return base; }
+  let world = vec4<f32>(pos[i * 3u], pos[i * 3u + 1u], pos[i * 3u + 2u], 1.0);
+  let c = u.photoClipFromCloud * world;
+  // Atras da lente. Sem este corte a divisao espelha a cena e a foto cola-se
+  // tambem ao que esta por tras da camera -- o artefacto classico do projetor.
+  if (c.w <= 1e-9) { return base; }
+  let ndc = c.xy / c.w;
+  if (any(abs(ndc) > vec2<f32>(1.0, 1.0))) { return base; }
+  // NDC cresce para cima, a textura cresce para baixo.
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  // 'textureSampleLevel' e nao 'textureSample': um shader de compute nao tem
+  // derivadas, entao o nivel de mipmap tem de ser explicito. O implicito nem
+  // compila aqui.
+  let s = textureSampleLevel(photoTex, photoSamp, uv, 0.0);
+  return mix(base, s.rgb, u.photoMix * s.a);
+}
+
+fn shade(i : u32, z : f32) -> vec3<f32> {
+  return photoOver(i, baseShade(i, z));
 }
 
 @compute @workgroup_size(256)

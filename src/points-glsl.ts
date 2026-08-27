@@ -49,6 +49,12 @@ uniform uint uClassHidden;
 // compute: os dois têm de concordar, ou o filtro muda de significado quando o
 // navegador não tem WebGPU.
 uniform vec2 uZRange;
+// A foto projetada, e a matriz que leva um ponto local-da-nuvem ao espaco de
+// recorte da camera dela. 'uPhotoMix' a zero desliga, e e o que o caso comum
+// paga: um branch, e nenhuma amostragem.
+uniform sampler2D uPhoto;
+uniform mat4 uPhotoClipFromCloud;
+uniform float uPhotoMix;
 
 // The same five stops the instanced material ramps through, and the same ASPRS
 // palette, as constants rather than a texture: 5 and 19 entries of compile-time
@@ -140,6 +146,27 @@ void main() {
   } else {
     rgb = aColor.rgb;
   }
+  // Textura projetiva: o ponto pergunta que pixel o fotografou. O gemeo exacto
+  // de 'photoOver' no WGSL, e por isso as duas vias tem de mudar juntas -- uma
+  // foto que assenta no WebGPU e escorrega no WebGL 2 le-se como erro de dados.
+  //
+  // NO ESTAGIO DE VERTICE, e nao no de fragmento: aqui cada ponto e uma
+  // amostra so, contra uma por pixel do splat. 'textureLod' e nao 'texture'
+  // porque um vertex shader nao tem derivadas para escolher o mipmap.
+  if (uPhotoMix > 0.0) {
+    vec4 pc = uPhotoClipFromCloud * vec4(aPos, 1.0);
+    // Atras da lente: sem este corte a divisao espelha a cena.
+    if (pc.w > 1e-9) {
+      vec2 ndc = pc.xy / pc.w;
+      if (all(lessThanEqual(abs(ndc), vec2(1.0)))) {
+        // NDC cresce para cima, a textura cresce para baixo.
+        vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        vec4 ph = textureLod(uPhoto, uv, 0.0);
+        rgb = mix(rgb, ph.rgb, uPhotoMix * ph.a);
+      }
+    }
+  }
+
   vColor = vec4(rgb, 1.0);
   vId = uint(gl_VertexID);
 

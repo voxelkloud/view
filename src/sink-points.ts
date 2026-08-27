@@ -108,6 +108,13 @@ export class PointsSink implements PointSink {
   /** Ver {@link ComputeSink.presentClasses}. Preenchido por `packNodeMeta`. */
   private readonly classPresent = new Uint8Array(256);
 
+  /** Ver {@link ComputeSink.setPhoto} — o mesmo contrato, em GL. */
+  private photoTex: WebGLTexture | undefined;
+  private photoImage: ImageBitmap | undefined;
+  private photoMix = 0;
+  private readonly photoMatrix = new Float32Array(16);
+  private readonly blankTex: WebGLTexture;
+
   private readonly live = new Uint8Array(MAX_SLOTS);
   private readonly lastLive: number[] = [];
   private readonly nodeOfSlot: (number | undefined)[] = [];
@@ -160,6 +167,12 @@ export class PointsSink implements PointSink {
     if (scalarAttribute !== undefined) this.scalarCpu = new Float32Array(this.capacity);
     this.vao = this.buildVao();
     this.emptyVao = gl.createVertexArray()!;
+
+    this.blankTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.blankTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
     this.cutTex = intTexture(gl, gl.RGBA8UI, CUT_W, Math.max(1, Math.ceil(cut.bytes.byteLength / 4 / CUT_W)));
     this.liveTex = intTexture(gl, gl.R8UI, LIVE_W, MAX_SLOTS / LIVE_W);
@@ -453,6 +466,7 @@ export class PointsSink implements PointSink {
         "uMaxPx", "uCut", "uLive", "uUseMask", "uRootMin", "uRootSize",
         "uCutDepth", "uUseCut", "uMode", "uFlatColor", "uElevRange",
         "uScalarRange", "uMaxLevel", "uRound", "uClassHidden", "uZRange",
+        "uPhoto", "uPhotoClipFromCloud", "uPhotoMix",
       ];
       u = Object.fromEntries(names.map((n) => [n, this.gl.getUniformLocation(program, n)]));
       this.locCache.set(program, u);
@@ -485,6 +499,14 @@ export class PointsSink implements PointSink {
     gl.bindTexture(gl.TEXTURE_2D, this.liveTex);
     gl.uniform1i(u["uLive"]!, 1);
     gl.uniform1i(u["uUseMask"]!, 1);
+    // A foto na unidade 2. Ligada SEMPRE, mesmo desligada: um sampler sem
+    // textura em WebGL 2 amostra preto e emite aviso a cada draw, e um aviso
+    // por frame afoga o console onde os erros reais aparecem.
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.photoTex ?? this.blankTex);
+    gl.uniform1i(u["uPhoto"]!, 2);
+    gl.uniform1f(u["uPhotoMix"]!, this.photoTex === undefined ? 0 : this.photoMix);
+    gl.uniformMatrix4fv(u["uPhotoClipFromCloud"]!, false, this.photoMatrix);
     gl.uniform3f(u["uRootMin"]!, this.rootBox.min[0], this.rootBox.min[1], this.rootBox.min[2]);
     gl.uniform3f(u["uRootSize"]!, this.rootBox.size[0], this.rootBox.size[1], this.rootBox.size[2]);
     gl.uniform1i(u["uCutDepth"]!, this.cutDepth + 1);
@@ -535,6 +557,35 @@ export class PointsSink implements PointSink {
     this.zHi = hi;
   }
 
+  /** Ver {@link PointCloudView.setPhoto} — o gemeo em WebGL 2 do braco compute. */
+  setPhoto(
+    image: ImageBitmap | undefined,
+    clipFromCloud: Float32Array | undefined,
+    mix: number,
+  ): void {
+    this.photoMix = mix;
+    if (clipFromCloud !== undefined && clipFromCloud.length === 16)
+      this.photoMatrix.set(clipFromCloud);
+    // So quando a IMAGEM muda: orbitar reescreve a matriz a cada frame, e
+    // reenviar doze megapixels com ela seria a diferenca entre isto servir e nao.
+    if (image === this.photoImage) return;
+    this.photoImage = image;
+    const gl = this.gl;
+    if (this.photoTex !== undefined) gl.deleteTexture(this.photoTex);
+    this.photoTex = undefined;
+    if (image !== undefined) {
+      this.photoTex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, this.photoTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, image);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      // CLAMP nos dois eixos: a projecao ja rejeita fora de 0..1, mas um
+      // REPEAT deixaria a borda sangrar do outro lado por causa do filtro.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+  }
+
   /** Ver {@link PointCloudView.presentClasses}. */
   get presentClasses(): readonly number[] {
     const out: number[] = [];
@@ -553,6 +604,8 @@ export class PointsSink implements PointSink {
     gl.deleteVertexArray(this.emptyVao);
     gl.deleteTexture(this.cutTex);
     gl.deleteTexture(this.liveTex);
+    gl.deleteTexture(this.blankTex);
+    if (this.photoTex !== undefined) gl.deleteTexture(this.photoTex);
     if (this.ownsProg) gl.deleteProgram(this.prog);
 
     this.blocks.clear();
