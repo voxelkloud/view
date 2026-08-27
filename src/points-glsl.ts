@@ -44,6 +44,11 @@ uniform float uMaxLevel;
 // Bitmask das classes ESCONDIDAS: bit n esconde o código n para 0..18, bit 31
 // esconde o balde "fora do padrão". Zero não esconde nada, que é o default.
 uniform uint uClassHidden;
+// A faixa de ALTURA, em Z local-da-nuvem — o mesmo frame de 'aPos'. Desligada
+// é [-3.4e38, 3.4e38], que nenhum ponto real ultrapassa. Ver 'zOff' no braço
+// compute: os dois têm de concordar, ou o filtro muda de significado quando o
+// navegador não tem WebGPU.
+uniform vec2 uZRange;
 
 // The same five stops the instanced material ramps through, and the same ASPRS
 // palette, as constants rather than a texture: 5 and 19 entries of compile-time
@@ -98,7 +103,10 @@ void main() {
   // writes no depth, so a hidden class stops occluding what is behind it.
   bool classOff = uClassHidden != 0u
     && (uClassHidden >> (aClass <= 18u ? aClass : 31u) & 1u) == 1u;
-  if (classOff
+  // Fora da faixa de altura sai pela MESMA porta, e pela mesma razão: quem sai
+  // aqui não escreve profundidade, logo deixa de ocluir o que está atrás.
+  bool zOff = aPos.z < uZRange.x || aPos.z > uZRange.y;
+  if (classOff || zOff
       || (uUseMask == 1 && texelFetch(uLive, ivec2(slotId & 1023, slotId >> 10), 0).r == 0u)) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     gl_PointSize = 0.0;

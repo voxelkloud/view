@@ -398,12 +398,22 @@ export class BlockAllocator {
  */
 export const MAX_SLOTS = 65_536;
 // 256 e não 192 desde a DEC-B6: os quatro planos de corte precisam de
-// alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Manter
-// este número em sincronia com o `struct U` do WGSL é obrigatório — um uniform
-// mais curto que o struct dá layout inválido, e o cabeçalho de `compute-wgsl`
-// avisa que isso NÃO lança: os passes silenciam e a tela fica preta com todos
-// os contadores da CPU corretos.
-const UNIFORM_BYTES = 256;
+// alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Depois
+// veio a faixa de altura, um vec2 que só cabia DEPOIS do array de planos, e o
+// struct fecha em 272. Manter este número em sincronia com o `struct U` do
+// WGSL é obrigatório — um uniform mais curto que o struct dá layout inválido, e
+// o cabeçalho de `compute-wgsl` avisa que isso NÃO lança: os passes silenciam e
+// a tela fica preta com todos os contadores da CPU corretos.
+const UNIFORM_BYTES = 272;
+
+/**
+ * Faixa de altura DESLIGADA.
+ *
+ * Um sentinela em vez de um booleano no uniform: nenhum ponto real passa de
+ * 3.4e38, então o teste no shader é o mesmo com ou sem filtro e o caso comum
+ * não paga nem um branch nem quatro bytes de flag.
+ */
+export const Z_RANGE_OFF: readonly [number, number] = [-3.4e38, 3.4e38];
 const WORKGROUP = 256;
 
 /**
@@ -527,6 +537,8 @@ export class ComputeSink implements PointSink {
   private maxLevel = 1;
   /** Bitmask das classes escondidas, lido pelo shader em qualquer modo. */
   private classHidden = 0;
+  private zLo = Z_RANGE_OFF[0];
+  private zHi = Z_RANGE_OFF[1];
   /**
    * Que códigos ASPRS esta nuvem realmente contém, um flag por código.
    *
@@ -990,6 +1002,12 @@ export class ComputeSink implements PointSink {
     this.classHidden = mask >>> 0;
   }
 
+  /** Ver {@link PointCloudView.setZRange} — Z LOCAL DA NUVEM, já convertido. */
+  setZRange(lo: number, hi: number): void {
+    this.zLo = lo;
+    this.zHi = hi;
+  }
+
   /**
    * Os códigos ASPRS vistos até agora, crescente e sem repetição.
    *
@@ -1060,6 +1078,10 @@ export class ComputeSink implements PointSink {
     // O slot 47 era o padding antes de 'clip'; agora carrega a máscara de
     // classes escondidas (u32), e o array continua alinhado a 16 bytes.
     this.uu[47] = this.classHidden;
+    // Slots 64/65: a faixa de altura, depois do array de planos. Ver
+    // {@link UNIFORM_BYTES} — foi por causa destes dois que ele cresceu.
+    this.uf[64] = this.zLo;
+    this.uf[65] = this.zHi;
     const e = modelMatrix.elements;
     for (let i = 0; i < nPlanes; i++) {
       const nx = planes![i * 4]!;

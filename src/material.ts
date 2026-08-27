@@ -75,6 +75,8 @@ export interface PointCloudMaterial extends NodeMaterial {
    * where no class code streams at all.
    */
   uClassHidden: { value: number };
+  uZLo: { value: number };
+  uZHi: { value: number };
   /** CLOUD-LOCAL min corner of the root box — the frame `pointOffset` is in. */
   uRootMin: { value: { x: number; y: number; z: number } };
   /** CLOUD-LOCAL extent of the root box, per axis. */
@@ -205,6 +207,12 @@ export function createPointMaterial(
   const uScalarMin = uniform(o.scalarRange[0]);
   const uScalarMax = uniform(o.scalarRange[1]);
   const uClassHidden = uniform(0, "uint");
+  // A faixa de ALTURA, em Z local-da-nuvem. Ao contrário do filtro de classes
+  // — que aqui só age no modo classificação, porque é lá que o código chega —
+  // esta vale em TODOS os modos: a altura vem de `pointOffset`, no estágio de
+  // vértice, que nenhum modo de cor redefine.
+  const uZLo = uniform(-3.4e38);
+  const uZHi = uniform(3.4e38);
 
   // Per-object uniforms. `onObjectUpdate` is the same mechanism three uses for
   // `highpModelViewMatrix`; these land in the OBJECT bind group, so they do not
@@ -385,7 +393,14 @@ export function createPointMaterial(
     // pixel size, so the quad and any radius varying always agree.
     const px = dWorld.mul(projFactor).toVar('vkPx');
     const pxC = px.clamp(uMinPixelSize, uMaxPixelSize).toVar('vkPxC');
-    const d = dWorld.mul(pxC.div(px.max(1e-6))).mul(alive).toVar('vkD');
+    // Fora da faixa de altura o quad colapsa, pelo mesmo mecanismo da
+    // liveness do arena: um fator 0 no diâmetro rasteriza zero área — e, ao
+    // contrário de um `Discard`, também não escreve profundidade.
+    const inZ = p.z
+      .greaterThanEqual(uZLo)
+      .select(float(1), float(0))
+      .mul(p.z.lessThanEqual(uZHi).select(float(1), float(0)));
+    const d = dWorld.mul(pxC.div(px.max(1e-6))).mul(alive).mul(inZ).toVar('vkD');
 
     varyingProperty('vec2', 'vkCorner').assign(positionGeometry.xy);
 
@@ -482,6 +497,8 @@ export function createPointMaterial(
     uScalarMin,
     uScalarMax,
     uClassHidden,
+    uZLo,
+    uZHi,
     uSizeMultiplier,
     uMinPixelSize,
     uMaxPixelSize,

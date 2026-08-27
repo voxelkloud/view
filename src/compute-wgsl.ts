@@ -47,6 +47,11 @@ struct U {
   // que era o padding antes de 'clip', então o layout não mexe.
   classHidden : u32,
   clip      : array<vec4<f32>, 4>,
+  // A faixa de ALTURA em que um ponto é desenhado, em Z local-da-nuvem — o
+  // mesmo frame de 'pos' e de 'elevMin/elevMax'. Acrescentada DEPOIS do array
+  // de planos, e não num padding no meio: os offsets de tudo o que já existia
+  // ficam onde estavam, e o custo é um vec4 a mais no buffer.
+  zRange    : vec2<f32>,
 };
 
 @group(0) @binding(0) var<storage, read>       pos   : array<f32>;
@@ -103,6 +108,23 @@ fn classOff(i : u32) -> bool {
   let code = nmeta[i] >> 24u;
   let bit = select(31u, code, code <= 18u);
   return ((u.classHidden >> bit) & 1u) == 1u;
+}
+
+// FORA DA FAIXA DE ALTURA. O irmão geométrico de 'classOff', e pela mesma razão
+// chamado dos dois passes: um ponto que não se vê mas ainda escreve
+// profundidade continua a ocluir o que está atrás dele.
+//
+// Existe porque nem toda nuvem traz o ruído classificado. Num levantamento
+// aéreo da NOAA os retornos que voam já vêm em classe 18 e o filtro de classes
+// resolve; num scan terrestre cru, num E57 convertido ou numa nuvem de
+// fotogrametria não vem classificação nenhuma, e a única coisa que separa o
+// que voa do levantamento é a altura.
+//
+// Desligada é [-3.4e38, 3.4e38] — nenhum ponto real ultrapassa isso, então o
+// caso comum não paga um uniform de flag nem um branch a mais.
+fn zOff(i : u32) -> bool {
+  let z = pos[i * 3u + 2u];
+  return z < u.zRange.x || z > u.zRange.y;
 }
 
 // Screen pixel for point i, or ok=false when it is off screen or behind the eye.
@@ -270,7 +292,7 @@ fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u.count) { return; }
   if (live[slotOf(i)] == 0u) { return; }
-  if (classOff(i)) { return; }
+  if (classOff(i) || zOff(i)) { return; }
   let s = project(i);
   if (!s.ok) { return; }
   let ri = i32(ceil(s.r - 0.5));
@@ -294,7 +316,7 @@ fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u.count) { return; }
   if (live[slotOf(i)] == 0u) { return; }
-  if (classOff(i)) { return; }
+  if (classOff(i) || zOff(i)) { return; }
   let s = project(i);
   if (!s.ok) { return; }
   let rgb = shade(i, pos[i * 3u + 2u]) * 255.0;

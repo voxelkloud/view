@@ -65,6 +65,7 @@ import { PointCloudObject3D } from "./object.js";
 import { pickPoint as pickPointOnClouds } from "./pick.js";
 import type { PickPointOptions, PickResult } from "./pick.js";
 import { GroundIndex, type GroundIndexOptions } from "./ground.js";
+import { GROUND_TAIL, GroundLevel } from "./ground-level.js";
 import { extractProfile as extractProfileFromCloud } from "./profile/index.js";
 import type {
   ProfileBatch,
@@ -83,7 +84,12 @@ import {
 } from "./deviation.js";
 import type { DeviationCluster, TriangleBvh } from "./deviation.js";
 import { OverlayRenderer } from "./overlay.js";
-import { ComputeRasterizer, ComputeSink, OVERLAY_DEPTH_FORMAT } from "./sink-compute.js";
+import {
+  ComputeRasterizer,
+  ComputeSink,
+  OVERLAY_DEPTH_FORMAT,
+  Z_RANGE_OFF,
+} from "./sink-compute.js";
 import { PointsRasterizer, PointsSink } from "./sink-points.js";
 import { PerNodeSink } from "./sink.js";
 import type { PointSink } from "./sink.js";
@@ -536,6 +542,14 @@ interface CloudHandle {
   minPitchWorld: number;
   /** How far `minPitchWorld` has scanned `nodePointSpacing`. */
   scannedNodes: number;
+  /**
+   * Where this cloud's ground is, refined as nodes stream in.
+   *
+   * A PROPERTY OF THE CLOUD, like `minPitchWorld`: the header's floor is a
+   * single bad return away from being useless, so anything that has to place
+   * geometry under the survey asks here instead. See {@link GroundLevel}.
+   */
+  readonly groundLevel: GroundLevel;
 }
 
 /**
@@ -1160,6 +1174,13 @@ export class PointCloudView {
       prevMinSpacing: pitchOf(hierarchy, hierarchy.root.index, 0),
       minPitchWorld: pitchOf(hierarchy, hierarchy.root.index, 0),
       scannedNodes: 0,
+      // The same cloud-relative range the elevation ramp is given, for the same
+      // reason: `positions` are relative to `source.bounds.min`, and the tight
+      // bounds are absolute CRS.
+      groundLevel: new GroundLevel(
+        ...cloudRelativeElevationRange(source),
+        source.pointCount,
+      ),
     });
     this.dirty = true;
     return object;
@@ -1249,6 +1270,28 @@ export class PointCloudView {
       (b.min[1] + b.max[1]) / 2,
       (b.min[2] + b.max[2]) / 2,
     );
+  }
+
+  /**
+   * A cloud's GROUND, in scene units — where imagery under the survey belongs.
+   *
+   * `undefined` until the cloud has streamed in far enough for the answer to be
+   * FINAL — deliberately, so a caller can WAIT rather than place something on a
+   * first guess and move it a second later. Ask again on a timer; when it
+   * answers, the number does not move afterwards.
+   *
+   * A caller that cannot wait falls back to `tightBoundingBox.min[2]`, which is
+   * the same answer on a clean cloud and a far worse one on a noisy survey.
+   * See {@link GroundLevel} for why the declared floor is not usable on its own.
+   */
+  groundZ(index = 0): number | undefined {
+    const h = this.clouds[index];
+    if (h === undefined) return undefined;
+    const relative = h.groundLevel.get();
+    if (relative === undefined) return undefined;
+    // Cloud-relative to scene: the object already carries that offset, and it
+    // is zero for the cloud that DEFINED the scene origin.
+    return relative + (h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2]);
   }
 
   /** Where `frameCloud` aims — the orbit target for controls. */
@@ -1607,6 +1650,62 @@ export class PointCloudView {
    * o modo. O material instanciado ainda só filtra no modo classificação: lá o
    * código chega pelo `scalarValue`, que os outros modos usam para outra coisa.
    */
+  /**
+   * A faixa de ALTURA em que uma nuvem é desenhada, em unidades de CENA.
+   *
+   * `undefined` desliga. Existe para o ruído que não vem classificado: num
+   * levantamento aéreo da NOAA os retornos que voam já chegam em classe 18 e
+   * {@link setHiddenClasses} resolve exatamente, sem falso positivo nenhum; num
+   * scan terrestre cru, num E57 convertido ou numa nuvem de fotogrametria não
+   * há classificação, e a altura é a única coisa que separa o que voa do
+   * levantamento.
+   *
+   * NÃO é uma limpeza: é um corte, e um corte não sabe distinguir um retorno
+   * ruim de uma torre legítima. Quem chama tem de o mostrar e deixar mexer —
+   * ver {@link robustZRange} para um ponto de partida honesto.
+   *
+   * Vale nos três braços do rasterizador. Um filtro que só agisse num deles
+   * viraria um bug de "funciona na minha máquina", que é a razão de o filtro de
+   * classes também os cobrir todos.
+   */
+  setZRange(range: readonly [number, number] | undefined, cloudIndex = 0): void {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return;
+    // De cena para local-da-nuvem: uma translação, e só o Z interessa.
+    const dz = h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2];
+    const lo = range === undefined ? Z_RANGE_OFF[0] : range[0] - dz;
+    const hi = range === undefined ? Z_RANGE_OFF[1] : range[1] - dz;
+    if (h.material !== undefined) {
+      h.material.uZLo.value = lo;
+      h.material.uZHi.value = hi;
+    }
+    h.computeSink?.setZRange(lo, hi);
+    h.pointsSink?.setZRange(lo, hi);
+    this.dirty = true;
+  }
+
+  /**
+   * Uma faixa de altura de partida que descarta o rabo, em unidades de cena.
+   *
+   * Os mesmos 0,2% de cada ponta que {@link groundZ} usa para achar o chão, e
+   * pela mesma razão: o mínimo e o máximo de um arquivo são justamente os dois
+   * retornos que ninguém quer. `undefined` enquanto a nuvem não transmitiu o
+   * suficiente para a resposta ser final — ver {@link GroundLevel}.
+   *
+   * É um PONTO DE PARTIDA para uma UI, não um valor a aplicar sozinho: numa
+   * nuvem limpa ela corta 0,4% de dados legítimos, e quem a aplicar sem mostrar
+   * está a apagar coisa boa em silêncio.
+   */
+  robustZRange(cloudIndex = 0): [number, number] | undefined {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return undefined;
+    const lo = h.groundLevel.get();
+    const hi = h.groundLevel.get(1 - GROUND_TAIL);
+    if (lo === undefined || hi === undefined) return undefined;
+    const dz = h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2];
+    return [lo + dz, hi + dz];
+  }
+
   setHiddenClasses(codes: Iterable<number>, cloudIndex = 0): void {
     const h = this.clouds[cloudIndex];
     if (h === undefined) return;
@@ -2295,6 +2394,20 @@ export class PointCloudView {
       // driver that measures a tile's pitch from its decoded points can only
       // learn it at this moment.
       if (pitch < h.minPitchWorld) h.minPitchWorld = pitch;
+      // Folded in HERE, the one place every decoded node of every cloud passes
+      // through on its way to a sink — so the estimate does not have to be
+      // built twice, once per rasteriser. Guarded on the frame rather than
+      // assumed: this reads Z as a float relative to the cloud origin, which is
+      // what the view's own `openPoints` asks for and not what an `int32`
+      // caller would get.
+      if (p.data.frame.format === "float32" && p.data.frame.originPolicy === "cloud")
+        h.groundLevel.add(
+          p.data.positions as Float32Array,
+          p.data.numPoints,
+          // A classe, quando a nuvem tem uma: o histograma mede o LEVANTAMENTO,
+          // e um retorno que o arquivo rotulou de ruído não é o levantamento.
+          p.data.attributesByName.get(CLASS_ATTRIBUTE)?.array,
+        );
       const bytes = h.sink.attach(p.index, p.data, pitch, p.level);
       if (bytes > 0) {
         h.resident.add(p.index);

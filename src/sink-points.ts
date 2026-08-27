@@ -3,7 +3,7 @@ import type { Matrix4, PerspectiveCamera } from "three";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
 import { FS, FS_EDL, VS, VS_POST } from "./points-glsl.js";
-import { BlockAllocator, MAX_SLOTS, packNodeMeta } from "./sink-compute.js";
+import { BlockAllocator, MAX_SLOTS, Z_RANGE_OFF, packNodeMeta } from "./sink-compute.js";
 import { CLASS_ATTRIBUTE } from "./material-options.js";
 import type { PointReadback, PointSink } from "./sink.js";
 
@@ -103,6 +103,8 @@ export class PointsSink implements PointSink {
   private scalarCpu: Float32Array | undefined;
   /** Ver {@link ComputeSink.setClassHidden} — aqui é o mesmo uniform, em GL. */
   private classHidden = 0;
+  private zLo = Z_RANGE_OFF[0];
+  private zHi = Z_RANGE_OFF[1];
   /** Ver {@link ComputeSink.presentClasses}. Preenchido por `packNodeMeta`. */
   private readonly classPresent = new Uint8Array(256);
 
@@ -450,7 +452,7 @@ export class PointsSink implements PointSink {
         "uClipFromCloud", "uViewFromCloud", "uProjScale", "uSizeMul", "uMinPx",
         "uMaxPx", "uCut", "uLive", "uUseMask", "uRootMin", "uRootSize",
         "uCutDepth", "uUseCut", "uMode", "uFlatColor", "uElevRange",
-        "uScalarRange", "uMaxLevel", "uRound", "uClassHidden",
+        "uScalarRange", "uMaxLevel", "uRound", "uClassHidden", "uZRange",
       ];
       u = Object.fromEntries(names.map((n) => [n, this.gl.getUniformLocation(program, n)]));
       this.locCache.set(program, u);
@@ -475,6 +477,7 @@ export class PointsSink implements PointSink {
     gl.uniform1f(u["uMinPx"]!, o.minPixelSize);
     gl.uniform1f(u["uMaxPx"]!, o.maxPixelSize);
     gl.uniform1ui(u["uClassHidden"]!, this.classHidden);
+    gl.uniform2f(u["uZRange"]!, this.zLo, this.zHi);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.cutTex);
     gl.uniform1i(u["uCut"]!, 0);
@@ -524,6 +527,12 @@ export class PointsSink implements PointSink {
   /** Ver {@link PointCloudView.setHiddenClasses} — aqui é só o uniform. */
   setClassHidden(mask: number): void {
     this.classHidden = mask >>> 0;
+  }
+
+  /** Ver {@link PointCloudView.setZRange} — Z LOCAL DA NUVEM, já convertido. */
+  setZRange(lo: number, hi: number): void {
+    this.zLo = lo;
+    this.zHi = hi;
   }
 
   /** Ver {@link PointCloudView.presentClasses}. */
