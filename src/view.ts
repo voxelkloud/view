@@ -28,6 +28,7 @@ import {
 // demand, in the one branch that needs it.
 import type { WebGPURenderer } from "three/webgpu";
 import { OctreeCut } from "./cut.js";
+import { orthoSampleClouds, type OrthoSample } from "./ortho.js";
 // The NUMBERS half, statically: every rasteriser sizes splats from these.
 import {
   CLASS_ATTRIBUTE,
@@ -1049,6 +1050,11 @@ export class PointCloudView {
           },
           {
             pointBudget: this.lodOptions.pointBudget,
+            // The budget is a VIEW-wide number and this sink serves ONE cloud.
+            // Handing it the cloud's own count is what stops a page of small
+            // clouds from reserving the budget once per panel — see
+            // `initialCapacity`.
+            cloudPoints: source.pointCount,
             colorMode: resolved.colorMode,
             sizeMultiplier: resolved.sizeMultiplier,
             minPixelSize: resolved.minPixelSize,
@@ -1076,6 +1082,7 @@ export class PointCloudView {
             },
             {
               pointBudget: this.lodOptions.pointBudget,
+              cloudPoints: source.pointCount,
               colorMode: resolved.colorMode,
               sizeMultiplier: resolved.sizeMultiplier,
               minPixelSize: resolved.minPixelSize,
@@ -1684,6 +1691,15 @@ export class PointCloudView {
     this.dirty = true;
   }
 
+  /** A ultima foto projetada, para {@link setPhotoOpacity} nao a reenviar. */
+  private photo:
+    | {
+        readonly image: ImageBitmap;
+        readonly clipFromScene: Float32Array | Float64Array;
+        readonly opacity?: number;
+      }
+    | undefined;
+
   /**
    * Projeta uma foto sobre a cena — textura projetiva, e nao uma imagem por cima.
    *
@@ -1737,7 +1753,22 @@ export class PointCloudView {
       h.computeSink?.setPhoto(photo?.image, m, mix);
       h.pointsSink?.setPhoto(photo?.image, m, mix);
     }
+    this.photo = photo;
     this.dirty = true;
+  }
+
+  /**
+   * So a mistura da foto, sem lhe tocar na imagem nem na matriz.
+   *
+   * Separado de {@link setPhoto} porque um cursor de opacidade dispara a cada
+   * pixel arrastado, e reenviar doze megapixels por evento e a diferenca entre
+   * o controlo responder e engasgar. Os sinks ja so reenviam quando a IMAGEM
+   * muda, e isto garante que ela nao muda.
+   */
+  setPhotoOpacity(opacity: number): void {
+    const p = this.photo;
+    if (p === undefined) return;
+    this.setPhoto({ image: p.image, clipFromScene: p.clipFromScene, opacity });
   }
 
   /**
@@ -1888,6 +1919,43 @@ export class PointCloudView {
         readPoints: (index: number) => h.sink.readPoints(index),
       })),
       options,
+    );
+  }
+
+  /**
+   * Uma vista de cima da cor da nuvem sobre um retângulo do chão.
+   *
+   * Serve o alinhamento automático de fotos: a correlação precisa das duas
+   * imagens na mesma grelha, e a nuvem só existe em pontos. Ver {@link
+   * orthoSampleClouds} para o porquê de o ponto mais alto ganhar a célula.
+   *
+   * Lê a SELEÇÃO ATUAL, e não o arquivo: é o que está na GPU neste instante,
+   * logo o detalhe depende de quanto a câmera já revelou. Uma vista de topo
+   * sobre a pegada de uma foto tem o bastante; uma câmera longe não teria, e
+   * quem chamar isto sem olhar para o que está carregado alinha contra uma
+   * versão grosseira sem nada a dizê-lo.
+   */
+  orthoSample(
+    min: readonly [number, number],
+    size: readonly [number, number],
+    width: number,
+    height: number,
+    cloudIndex?: number,
+  ): OrthoSample {
+    return orthoSampleClouds(
+      this.clouds.map((h, i) => ({
+        cloudIndex: i,
+        cloudOrigin: h.object.cloudOrigin,
+        sceneOrigin: h.object.getSceneOrigin(),
+        selection: h.selection.indices,
+        selectionCount: h.selection.count,
+        readPoints: (index: number) => h.sink.readPoints(index),
+      })),
+      min,
+      size,
+      width,
+      height,
+      cloudIndex,
     );
   }
 

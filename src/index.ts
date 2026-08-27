@@ -84,3 +84,5 @@ export function isWebGPUAvailable(): boolean {
 }
 
 export const VOXELKLOUD_VIEW_VERSION = "0.0.0";
+
+export { orthoSampleClouds, type OrthoSample, type OrthoCloudContext } from "./ortho.js";
