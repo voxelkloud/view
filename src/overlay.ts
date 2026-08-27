@@ -241,7 +241,11 @@ struct U {
   screenW    : f32,
   screenH    : f32,
   hasTexture : f32,
-  _pad       : f32,
+  // SEMPRE POR CIMA, quando 1. Um overlay que serve para comparar com a nuvem
+  // não pode ser enterrado por ela: com o teste ligado, uma foto assente no
+  // solo desaparece em tudo o que sobe acima do plano e vê-se só nas
+  // depressões, o que se lê como a imagem ter buracos.
+  ignoreDepth : f32,
 };
 
 @group(0) @binding(0) var<uniform> u : U;
@@ -273,7 +277,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let stored = pointDepth[y * u32(u.screenW) + x];
   // Both are bit patterns of non-negative floats, which are monotonic in the
   // value — so this compares depths without decoding either.
-  if (bitcast<u32>(in.eyeDepth) > stored) {
+  if (u.ignoreDepth < 0.5 && bitcast<u32>(in.eyeDepth) > stored) {
     discard;
   }
   if (u.hasTexture > 0.5) {
@@ -314,6 +318,8 @@ interface DrawItem {
   imageId: number;
   /** The 3x3 that transforms this draw's normals, padded to a mat4. */
   normalMatrix: Float32Array | undefined;
+  /** `material.depthTest === false`: draw over the points, never under them. */
+  ignoreDepth: boolean;
 }
 
 type TexSource = ImageBitmap | HTMLImageElement | HTMLCanvasElement;
@@ -351,6 +357,16 @@ const colorOf = (material: unknown): [number, number, number, number] => {
 
 const isTransparent = (material: unknown): boolean =>
   (material as { transparent?: boolean } | undefined)?.transparent === true;
+
+/**
+ * three's `material.depthTest === false`.
+ *
+ * O caminho WebGL 2 desenha a cena pelo próprio three e já o honra; este
+ * compõe à mão dentro do resolve, e sem isto a flag era silenciosamente
+ * ignorada — que é a pior forma de uma opção falhar.
+ */
+const depthTestOff = (material: unknown): boolean =>
+  (material as { depthTest?: boolean } | undefined)?.depthTest === false;
 
 /** three's `material.map`, if it carries a decoded image we can upload. */
 function textureOf(material: unknown): { image: TexSource; id: number } | undefined {
@@ -465,6 +481,7 @@ export class OverlayRenderer {
           image: tex?.image,
           imageId: tex?.id ?? 0,
           normalMatrix,
+          ignoreDepth: depthTestOff(material),
         });
       }
       return;
@@ -482,6 +499,7 @@ export class OverlayRenderer {
       image: tex?.image,
       imageId: tex?.id ?? 0,
       normalMatrix,
+      ignoreDepth: depthTestOff(material),
     });
   }
 
@@ -722,7 +740,11 @@ export class OverlayRenderer {
       this.scratch[20] = width;
       this.scratch[21] = height;
       this.scratch[22] = draw.image !== undefined ? 1 : 0;
-      this.scratch[23] = this.xray ? 1 : 0;
+      // O MESMO slot serve dois structs: no caminho de malha é o xray, no
+      // caminho plano é o `ignoreDepth`. Os dois pipelines nunca partilham um
+      // draw, então cada um lê o que é seu.
+      this.scratch[23] =
+        geo.mesh === undefined ? (draw.ignoreDepth ? 1 : 0) : this.xray ? 1 : 0;
       if (draw.normalMatrix !== undefined) this.scratch.set(draw.normalMatrix, 24);
       this.scratch[40] = this.selected;
       const planes = this.clip;
