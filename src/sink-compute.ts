@@ -1,3 +1,4 @@
+import { initialCapacity } from "./capacity.js";
 import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Matrix4, PerspectiveCamera } from "three";
 import { COMPUTE_WGSL } from "./compute-wgsl.js";
@@ -24,6 +25,19 @@ const MODE_INDEX: Record<ColorMode["kind"], number> = {
 
 export interface ComputeSinkOptions {
   readonly pointBudget: number;
+  /**
+   * Points in the cloud this sink is for, across every level. A CEILING on the
+   * initial reservation, and the reason is arithmetic: a sink serves one cloud,
+   * residency cannot exceed what that cloud contains, so capacity above it can
+   * never be filled by anything.
+   *
+   * Left out, the budget alone decides — which is right for a caller who has
+   * not said and wrong for every caller who has. Twelve panels of a paper page,
+   * each holding between 34,720 and 512,359 points at a 4M budget, reserved
+   * 960 MB of CPU staging for a page that draws 3,065,580 points. See
+   * `demo/litept` for the measurement.
+   */
+  readonly cloudPoints?: number;
   readonly colorMode: ColorMode;
   readonly sizeMultiplier: number;
   readonly minPixelSize: number;
@@ -502,6 +516,8 @@ export class ComputeSink implements PointSink {
   private devMaxDistance = 5;
   private capacity: number;
   private slotCount = 0;
+  private grewTimes = 0;
+  private growMs = 0;
 
   private posBuf: GPUBuffer;
   private colBuf: GPUBuffer;
@@ -592,7 +608,7 @@ export class ComputeSink implements PointSink {
     // is strictly worse than rendering the capped budget.
     this.capacity = Math.min(
       this.maxBindablePoints(),
-      Math.max(1 << 16, Math.ceil(options.pointBudget * 1.25)),
+      Math.max(1 << 16, initialCapacity(options.pointBudget, 1.25, options.cloudPoints)),
     );
     this.alloc = new BlockAllocator(this.capacity);
     this.posBuf = this.storage(this.capacity * 12);
@@ -837,11 +853,19 @@ export class ComputeSink implements PointSink {
     return this.alloc.freeRunCount;
   }
 
+  /** Buffer doublings and what they cost. A reallocation copies every resident
+   *  byte, so one landing mid-drag is a hitch the INP measurement will find. */
+  get grew(): { times: number; ms: number } {
+    return { times: this.grewTimes, ms: Math.round(this.growMs) };
+  }
+
   private grow(need: number): void {
     // Same ceiling as the constructor: past it the bind group fails validation,
     // so growth stops there and `attach` refuses the node instead.
     const max = this.maxBindablePoints();
     if (this.capacity >= max) return;
+    const t0 = performance.now();
+    this.grewTimes++;
     let cap = this.capacity;
     while (cap < need && cap < max) cap *= 2;
     cap = Math.min(cap, max);
@@ -871,6 +895,7 @@ export class ComputeSink implements PointSink {
     this.capacity = cap;
     this.alloc.setCapacity(cap);
     this.bindStale = true;
+    this.growMs += performance.now() - t0;
   }
 
   attach(

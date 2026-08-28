@@ -1,3 +1,4 @@
+import { initialCapacity } from "./capacity.js";
 import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Matrix4, PerspectiveCamera } from "three";
 import type { OctreeCut } from "./cut.js";
@@ -38,6 +39,15 @@ const MODE_INDEX: Record<ColorMode["kind"], number> = {
 
 export interface PointsSinkOptions {
   readonly pointBudget: number;
+  /**
+   * Points in the cloud this sink is for, across every level. A ceiling on the
+   * initial reservation — see {@link initialCapacity} for why, and for the
+   * 1.03 GB it was worth on a twelve-panel page.
+   *
+   * It bites harder here than on the compute path: the slack below is 1.6 where
+   * that one uses 1.25, so an unclamped WebGL 2 sink reserved 28% more again.
+   */
+  readonly cloudPoints?: number;
   readonly colorMode: ColorMode;
   readonly sizeMultiplier: number;
   readonly minPixelSize: number;
@@ -150,7 +160,10 @@ export class PointsSink implements PointSink {
     // the ones it left go cold, and the compute spike measured that settling
     // near 1.6x the budget. Too tight a capacity does not fail — it evicts and
     // reloads in a loop, or grows.
-    this.capacity = Math.max(1 << 16, Math.ceil(options.pointBudget * 1.6));
+    this.capacity = Math.max(
+      1 << 16,
+      initialCapacity(options.pointBudget, 1.6, options.cloudPoints),
+    );
     this.alloc = new BlockAllocator(this.capacity);
     this.maxPointSizePx =
       (gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array)[1] ?? 0;

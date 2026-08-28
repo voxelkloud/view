@@ -103,6 +103,27 @@ needs that.
 New option, and it exists because a fallback nobody can reach on purpose is a
 fallback nobody finds out is broken — which is exactly what happened to this one.
 
+### Also in 0.6.0
+
+Landed after the sections above and worth naming, if not re-measuring here:
+
+- **Top-down is a real projection.** `ortho.ts` gives the view an orthographic
+  framing a cloud can compute for itself, rather than a perspective camera
+  pushed far away and hoped at.
+- **Ground level is a percentile, not a minimum.** One bad low return used to
+  decide where the ground was for the whole cloud, which put every
+  height-above-ground ramp on the wrong zero.
+- **Photos are sampled in the shader.** Both rasterisers project imagery onto
+  the points themselves; the CSS overlay that approximated it is gone.
+- **The view says which GPU it got, and what the shaders warned about.** See the
+  diagnostics section of the README.
+- **An overlay can draw over the points instead of under them.**
+- **Sinks no longer reserve for a cloud they will never hold.** Capacity is
+  clamped to the cloud's own point count where the caller knows it: twelve
+  panels at a 4M budget held **1.03 GB** of heap and now hold **178 MB**, with
+  no other metric moving. The growth path is untouched — this removes a
+  reservation, not the safety net.
+
 ## 0.5.2
 
 ### The compute rasteriser became the default in 0.5.1, and this says so
