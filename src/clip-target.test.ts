@@ -1,3 +1,4 @@
+import { PointCloudObject3D } from "./object.js";
 import { describe, expect, it } from "vitest";
 import { PointCloudView } from "./index.js";
 
@@ -104,7 +105,10 @@ describe("targetForClouds", () => {
     (view as unknown as { clouds: unknown[] }).clouds.push(
       ...boxes.map((b) => ({
         source: { tightBoundingBox: b },
-        object: { getSceneOrigin: () => origin },
+        // O objeto DE VERDADE, e não um duplo com `getSceneOrigin`: é ele que
+        // sabe converter para a cena, e um duplo aqui deixaria de cobrir a
+        // colocação — que é precisamente o que pode partir esta conta.
+        object: new PointCloudObject3D(origin, origin),
       })),
     );
     return view;
@@ -128,6 +132,21 @@ describe("targetForClouds", () => {
     const view = viewWithClouds([{ min: [1000, 2000, 0], max: [1010, 2010, 4] }], [1000, 2000, 0]);
     const t = view.targetForClouds();
     expect([t.x, t.y, t.z]).toEqual([5, 5, 2]);
+  });
+
+  it("segue uma nuvem COLOCADA para onde ela foi posta", () => {
+    // Sem isto, enquadrar um projeto multi-CRS apontaria a câmera para onde a
+    // nuvem estaria se nunca tivesse sido reprojetada — ou seja, para o vazio.
+    const view = viewWithClouds([{ min: [0, 0, 0], max: [10, 10, 0] }], [0, 0, 0]);
+    const clouds = (view as unknown as { clouds: { object: PointCloudObject3D }[] }).clouds;
+    clouds[0]!.object.setPlacement({
+      yaw: 0,
+      scale: 1,
+      pivot: [5, 5, 0],
+      at: [1005, 2005, 0],
+    });
+    const t = view.targetForClouds();
+    expect([t.x, t.y]).toEqual([1005, 2005]);
   });
 
   it("devolve a origem quando não há nuvem nenhuma", () => {

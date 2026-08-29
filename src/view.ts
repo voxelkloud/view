@@ -62,7 +62,7 @@ import type {
 // bundle, including the WebGL-only ones that have their own EDL in the
 // rasteriser.
 import type { EdlOptions, EdlPipeline } from "./edl.js";
-import { PointCloudObject3D } from "./object.js";
+import { PointCloudObject3D, type CloudPlacement } from "./object.js";
 import { pickPoint as pickPointOnClouds } from "./pick.js";
 import type { PickPointOptions, PickResult } from "./pick.js";
 import { GroundIndex, type GroundIndexOptions } from "./ground.js";
@@ -1199,15 +1199,17 @@ export class PointCloudView {
     const h = this.clouds[index];
     if (h === undefined) return;
     const b = h.source.tightBoundingBox;
-    const origin = h.object.getSceneOrigin();
-    const cx = (b.min[0] + b.max[0]) / 2 - origin[0];
-    const cy = (b.min[1] + b.max[1]) / 2 - origin[1];
-    const cz = (b.min[2] + b.max[2]) / 2 - origin[2];
-    const span = Math.max(
-      b.max[0] - b.min[0],
-      b.max[1] - b.min[1],
-      b.max[2] - b.min[2],
+    // A caixa JÁ NA CENA: uma nuvem colocada noutro sistema tem a sua caixa
+    // rodada e escalada, e enquadrá-la pelos números crus apontaria a câmera
+    // para onde ela estaria se não tivesse sido colocada.
+    const box = new Float64Array(6);
+    h.object.frame().sceneBox(
+      b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], box,
     );
+    const cx = (box[0]! + box[3]!) / 2;
+    const cy = (box[1]! + box[4]!) / 2;
+    const cz = (box[2]! + box[5]!) / 2;
+    const span = Math.max(box[3]! - box[0]!, box[4]! - box[1]!, box[5]! - box[2]!);
     const d = span * 0.9;
     this.camera.position.set(cx + d, cy - d, cz + d * 0.6);
     this.camera.lookAt(cx, cy, cz);
@@ -1221,21 +1223,25 @@ export class PointCloudView {
    * A união das bordas de TODAS as nuvens, em coordenadas de cena.
    *
    * `undefined` quando não há nenhuma. Todas partilham a origem de cena — a
-   * primeira a abrir define-a e as seguintes herdam-na — logo a união é uma
-   * subtração e não uma mudança de referencial por nuvem.
+   * primeira a abrir define-a e as seguintes herdam-na — mas NÃO partilham
+   * necessariamente o sistema de coordenadas, e por isso cada uma converte
+   * pela sua própria `frame` em vez de todas pela mesma subtração.
    */
   private allCloudsBox():
     | { min: [number, number, number]; max: [number, number, number] }
     | undefined {
     if (this.clouds.length === 0) return undefined;
-    const o = this.clouds[0]!.object.getSceneOrigin();
     const min: [number, number, number] = [Infinity, Infinity, Infinity];
     const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    const box = new Float64Array(6);
     for (const h of this.clouds) {
       const b = h.source.tightBoundingBox;
+      h.object.frame().sceneBox(
+        b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], box,
+      );
       for (let i = 0; i < 3; i++) {
-        min[i] = Math.min(min[i]!, b.min[i]! - o[i]!);
-        max[i] = Math.max(max[i]!, b.max[i]! - o[i]!);
+        min[i] = Math.min(min[i]!, box[i]!);
+        max[i] = Math.max(max[i]!, box[3 + i]!);
       }
     }
     return { min, max };
@@ -1296,9 +1302,9 @@ export class PointCloudView {
     if (h === undefined) return undefined;
     const relative = h.groundLevel.get();
     if (relative === undefined) return undefined;
-    // Cloud-relative to scene: the object already carries that offset, and it
-    // is zero for the cloud that DEFINED the scene origin.
-    return relative + (h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2]);
+    // Cloud-relative to scene: the frame carries that, and it is the identity
+    // for the cloud that DEFINED the scene origin.
+    return h.object.frame().localZToScene(relative);
   }
 
   /** Where `frameCloud` aims — the orbit target for controls. */
@@ -1306,12 +1312,14 @@ export class PointCloudView {
     const h = this.clouds[index];
     if (h === undefined) return new Vector3();
     const b = h.source.tightBoundingBox;
-    const o = h.object.getSceneOrigin();
-    return new Vector3(
-      (b.min[0] + b.max[0]) / 2 - o[0],
-      (b.min[1] + b.max[1]) / 2 - o[1],
-      (b.min[2] + b.max[2]) / 2 - o[2],
+    const c = { x: 0, y: 0, z: 0 };
+    h.object.frame().absToScene(
+      (b.min[0] + b.max[0]) / 2,
+      (b.min[1] + b.max[1]) / 2,
+      (b.min[2] + b.max[2]) / 2,
+      c,
     );
+    return new Vector3(c.x, c.y, c.z);
   }
 
   /**
@@ -1369,8 +1377,7 @@ export class PointCloudView {
       {
         selection: h.selection.indices,
         selectionCount: h.selection.count,
-        sceneOrigin: h.object.getSceneOrigin() as [number, number, number],
-        cloudOrigin: h.object.cloudOrigin as [number, number, number],
+        frame: h.object.frame(),
         node: (i: number) => h.hierarchy.node(i),
         readPoints: (i: number) => h.sink.readPoints(i),
       },
@@ -1678,10 +1685,11 @@ export class PointCloudView {
   setZRange(range: readonly [number, number] | undefined, cloudIndex = 0): void {
     const h = this.clouds[cloudIndex];
     if (h === undefined) return;
-    // De cena para local-da-nuvem: uma translação, e só o Z interessa.
-    const dz = h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2];
-    const lo = range === undefined ? Z_RANGE_OFF[0] : range[0] - dz;
-    const hi = range === undefined ? Z_RANGE_OFF[1] : range[1] - dz;
+    // De cena para local-da-nuvem. Só o Z interessa: o yaw roda em torno da
+    // vertical e por isso não lhe toca, e a escala é o que a `frame` desfaz.
+    const f = h.object.frame();
+    const lo = range === undefined ? Z_RANGE_OFF[0] : f.sceneZToLocal(range[0]);
+    const hi = range === undefined ? Z_RANGE_OFF[1] : f.sceneZToLocal(range[1]);
     if (h.material !== undefined) {
       h.material.uZLo.value = lo;
       h.material.uZHi.value = hi;
@@ -1736,19 +1744,22 @@ export class PointCloudView {
       if (h === undefined) continue;
       let m: Float32Array | undefined;
       if (photo !== undefined && photo.clipFromScene.length === 16) {
-        // De cena para local-da-nuvem e uma TRANSLACAO, entao a composicao
-        // mexe so na quarta coluna: M * T(d) deixa a rotacao onde estava e
-        // soma d ja projetado. Sem inversa, sem transposta.
-        const o = h.object.cloudOrigin;
-        const so = h.object.getSceneOrigin();
-        const dx = o[0] - so[0];
-        const dy = o[1] - so[1];
-        const dz = o[2] - so[2];
-        const c = photo.clipFromScene;
-        m = new Float32Array(16);
-        for (let i = 0; i < 12; i++) m[i] = c[i]!;
-        for (let r = 0; r < 4; r++)
-          m[12 + r] = c[r]! * dx + c[4 + r]! * dy + c[8 + r]! * dz + c[12 + r]!;
+        // De cena para local-da-nuvem. Era uma TRANSLACAO, e a composicao
+        // mexia so na quarta coluna; com uma colocacao ha rotacao e escala no
+        // meio, e a quarta coluna deixa de contar a historia toda.
+        //
+        // `matrixWorld` JA E essa transformacao — e a mesma que o rasterizador
+        // usa para desenhar —, por isso compor com ela em vez de a reconstruir
+        // e o que garante que a foto assenta onde os pontos assentam.
+        // Matrizes locais, e não os scratch da câmera: estes são reescritos
+        // por `buildCameraState` a cada quadro, e emprestá-los a um setter é
+        // guardar um alias que um dia se cruza com o laço de desenho.
+        const clipFromScene = new Matrix4().fromArray(
+          photo.clipFromScene as ArrayLike<number>,
+        );
+        m = new Float32Array(
+          clipFromScene.multiply(h.object.matrixWorld).elements,
+        );
       }
       h.computeSink?.setPhoto(photo?.image, m, mix);
       h.pointsSink?.setPhoto(photo?.image, m, mix);
@@ -1789,8 +1800,8 @@ export class PointCloudView {
     const lo = h.groundLevel.get();
     const hi = h.groundLevel.get(1 - GROUND_TAIL);
     if (lo === undefined || hi === undefined) return undefined;
-    const dz = h.object.cloudOrigin[2] - h.object.getSceneOrigin()[2];
-    return [lo + dz, hi + dz];
+    const f = h.object.frame();
+    return [f.localZToScene(lo), f.localZToScene(hi)];
   }
 
   setHiddenClasses(codes: Iterable<number>, cloudIndex = 0): void {
@@ -1836,6 +1847,47 @@ export class PointCloudView {
    * Quem grava uma colocação PRECISA disto: uma matriz em coordenadas de cena
    * só vale enquanto esta nuvem estiver aberta, e é a de CRS que se guarda.
    */
+  /**
+   * Put a cloud somewhere other than where its own coordinates say.
+   *
+   * The case this exists for: a project whose layers arrive in DIFFERENT
+   * coordinate systems. Every cloud in a scene is positioned by subtracting one
+   * shared scene origin, which is exactly right while they all mean the same
+   * thing by a coordinate and catastrophically wrong when they do not — two
+   * projections put the same ground thousands of kilometres apart, so the
+   * second cloud lands off in the void, the camera frames both, and every cloud
+   * becomes a sub-pixel dot. No error is raised anywhere, because no step did
+   * anything wrong; the assumption was never checked.
+   *
+   * The caller supplies the {@link CloudPlacement} — this package has no
+   * projection database and should not grow one. Fitting it is the host's job:
+   * project a grid of control points from the cloud's system into the
+   * project's, fit a similarity by least squares, and REPORT THE RESIDUAL, so
+   * that a pair of systems the fit cannot reconcile is refused rather than
+   * drawn a metre out of place.
+   *
+   * A setter and not an `addCloud` argument, deliberately: resolving two
+   * projections may need a network round trip to a registry, and blocking the
+   * load of a cloud that will very likely need no placement at all would make
+   * every single-system project pay for the rare multi-system one.
+   *
+   * `undefined` puts the cloud back in its own coordinates.
+   */
+  setCloudPlacement(cloudIndex: number, placement: CloudPlacement | undefined): void {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return;
+    h.object.setPlacement(placement);
+    // A seleção do quadro anterior foi decidida com a nuvem noutro sítio: as
+    // caixas dos nós projetam-se noutros pixels agora, logo o erro de ecrã de
+    // cada nó mudou e o corte tem de ser refeito.
+    this.dirty = true;
+  }
+
+  /** What {@link setCloudPlacement} last stored, or `undefined`. */
+  cloudPlacement(cloudIndex = 0): CloudPlacement | undefined {
+    return this.clouds[cloudIndex]?.object.getPlacement();
+  }
+
   sceneOrigin(cloudIndex = 0): [number, number, number] | undefined {
     const h = this.clouds[cloudIndex];
     return h === undefined ? undefined : (h.object.getSceneOrigin() as [number, number, number]);
@@ -1911,8 +1963,7 @@ export class PointCloudView {
       screenY,
       this.clouds.map((h, cloudIndex) => ({
         cloudIndex,
-        cloudOrigin: h.object.cloudOrigin,
-        sceneOrigin: h.object.getSceneOrigin(),
+        frame: h.object.frame(),
         selection: h.selection.indices,
         selectionCount: h.selection.count,
         node: (index: number) => h.hierarchy.node(index),
@@ -1945,8 +1996,7 @@ export class PointCloudView {
     return orthoSampleClouds(
       this.clouds.map((h, i) => ({
         cloudIndex: i,
-        cloudOrigin: h.object.cloudOrigin,
-        sceneOrigin: h.object.getSceneOrigin(),
+        frame: h.object.frame(),
         selection: h.selection.indices,
         selectionCount: h.selection.count,
         readPoints: (index: number) => h.sink.readPoints(index),

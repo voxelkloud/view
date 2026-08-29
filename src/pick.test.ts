@@ -1,3 +1,4 @@
+import { CloudFrame } from "./object.js";
 import { PerspectiveCamera } from "three/webgpu";
 import { describe, expect, it } from "vitest";
 import { PointCloudObject3D, PointCloudView, pickPoint } from "./index.js";
@@ -25,8 +26,7 @@ describe("pickPoint", () => {
       [
         {
           cloudIndex: 0,
-          cloudOrigin: [10, 0, 0],
-          sceneOrigin: [0, 0, 0],
+          frame: new CloudFrame([10, 0, 0], [0, 0, 0]),
           selection: new Int32Array([7]),
           selectionCount: 1,
           node: (index: number) =>
@@ -80,8 +80,7 @@ describe("pickPoint", () => {
       [
         {
           cloudIndex: 0,
-          cloudOrigin: [1010, 2000, 3000],
-          sceneOrigin: [1000, 2000, 3000],
+          frame: new CloudFrame([1010, 2000, 3000], [1000, 2000, 3000]),
           selection: new Int32Array([7]),
           selectionCount: 1,
           node: (index: number) =>
@@ -126,8 +125,7 @@ describe("pickPoint", () => {
         [
           {
             cloudIndex: 0,
-            cloudOrigin: [10, 0, 0],
-            sceneOrigin: [0, 0, 0],
+            frame: new CloudFrame([10, 0, 0], [0, 0, 0]),
             selection: new Int32Array([7]),
             selectionCount: 1,
             node: () => ({
@@ -219,5 +217,72 @@ describe("PointCloudView pickPoint", () => {
       color: [1, 2, 3],
       scalarValue: 1.5,
     });
+  });
+});
+
+describe("pickPoint numa nuvem COLOCADA", () => {
+  /**
+   * A propriedade que faz a medição valer alguma coisa num projeto multi-CRS:
+   * o ponto é encontrado ONDE ESTÁ DESENHADO — na cena, depois da colocação —
+   * mas a coordenada devolvida é a do sistema em que a camada foi entregue.
+   *
+   * Se `position` viesse no sistema do projeto, a medição de quem carregou um
+   * scan em RD New sairia em UTM sem ninguém lhe ter pedido, e não bateria com
+   * o levantamento dele. Se `scenePosition` viesse antes da colocação, o pino
+   * da anotação apareceria a quilómetros do ponto clicado.
+   */
+  it("acha o ponto no sítio desenhado e devolve a coordenada NATIVA", () => {
+    // A nuvem vive em (1000, 2000) e é levada para junto da câmera por uma
+    // colocação que roda 90° e não escala.
+    const nativa: [number, number, number] = [1000, 2000, 0];
+    const frame = new CloudFrame(nativa, [0, 0, 0], {
+      yaw: Math.PI / 2,
+      scale: 1,
+      pivot: [1000, 2000, 0],
+      at: [10, 0, 0],
+    });
+
+    const camera = makeCamera();
+    const result = pickPoint(
+      camera,
+      1000,
+      1000,
+      500,
+      500,
+      [
+        {
+          cloudIndex: 0,
+          frame,
+          selection: new Int32Array([7]),
+          selectionCount: 1,
+          node: (index: number) =>
+            index === 7
+              ? {
+                  index: 7,
+                  level: 3,
+                  minX: 999,
+                  minY: 1999,
+                  minZ: -1,
+                  maxX: 1001,
+                  maxY: 2001,
+                  maxZ: 1,
+                }
+              : undefined,
+          readPoints: (index: number) =>
+            index === 7
+              ? { positions: new Float32Array([0, 0, 0]), start: 0, count: 1 }
+              : undefined,
+        },
+      ] as const,
+      { maxDistancePx: 24 },
+    );
+
+    expect(result).toBeDefined();
+    // A câmera olha para (10, 0, 0), que é para onde o pivô foi mandado.
+    expect(result!.scenePosition![0]).toBeCloseTo(10, 6);
+    expect(result!.scenePosition![1]).toBeCloseTo(0, 6);
+    // E a coordenada devolvida é a da NUVEM, não a da cena.
+    expect(result!.position[0]).toBeCloseTo(nativa[0], 6);
+    expect(result!.position[1]).toBeCloseTo(nativa[1], 6);
   });
 });

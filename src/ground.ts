@@ -1,3 +1,4 @@
+import type { CloudFrame } from "./object.js";
 /**
  * Synchronous spatial queries against the points currently resident on the
  * GPU-bound cut — the S1 surface.
@@ -39,11 +40,15 @@ export interface GroundNormal {
   readonly z: number;
 }
 
+/** Destinos reutilizados: os dois laços correm por milhões de pontos. */
+const scenePt = { x: 0, y: 0, z: 0 };
+const nodeBox = new Float64Array(6);
+
 interface ResidentSource {
   readonly selection: Int32Array | Uint32Array | readonly number[];
   readonly selectionCount: number;
-  readonly sceneOrigin: readonly [number, number, number];
-  readonly cloudOrigin: readonly [number, number, number];
+  /** Onde esta nuvem está na cena — ver {@link CloudFrame}. */
+  readonly frame: CloudFrame;
   node(index: number): { minX: number; minY: number; maxX: number; maxY: number } | undefined;
   readPoints(index: number):
     | {
@@ -130,8 +135,7 @@ export class GroundIndex {
     this.radius = radius;
     this.cell = cellSize;
 
-    const ox = source.cloudOrigin[0] - source.sceneOrigin[0];
-    const oy = source.cloudOrigin[1] - source.sceneOrigin[1];
+    const frame = source.frame;
 
     // Pass 1: the XY extent of the resident nodes, so the grid covers exactly
     // what is loaded rather than the whole cloud.
@@ -146,10 +150,14 @@ export class GroundIndex {
     for (let k = 0; k < source.selectionCount; k++) {
       const node = source.node(source.selection[k]!);
       if (node === undefined) continue;
-      const nx0 = node.minX - source.sceneOrigin[0];
-      const ny0 = node.minY - source.sceneOrigin[1];
-      const nx1 = node.maxX - source.sceneOrigin[0];
-      const ny1 = node.maxY - source.sceneOrigin[1];
+      // A caixa do nó na CENA. Sob rotação já não está alinhada aos eixos, e
+      // `sceneBox` devolve o limite que a contém — maior, nunca menor, para
+      // que a rejeição por bounds não descarte um nó que toca a janela.
+      frame.sceneBox(node.minX, node.minY, 0, node.maxX, node.maxY, 0, nodeBox);
+      const nx0 = nodeBox[0]!;
+      const ny0 = nodeBox[1]!;
+      const nx1 = nodeBox[3]!;
+      const ny1 = nodeBox[4]!;
       // Reject by bounds before any point of this node is read.
       if (nx1 < winMinX || nx0 > winMaxX || ny1 < winMinY || ny0 > winMaxY) continue;
       if (nx0 < minX) minX = nx0;
@@ -189,10 +197,11 @@ export class GroundIndex {
       const index = source.selection[k]!;
       const node = source.node(index);
       if (node !== undefined) {
-        const nx0 = node.minX - source.sceneOrigin[0];
-        const ny0 = node.minY - source.sceneOrigin[1];
-        const nx1 = node.maxX - source.sceneOrigin[0];
-        const ny1 = node.maxY - source.sceneOrigin[1];
+        frame.sceneBox(node.minX, node.minY, 0, node.maxX, node.maxY, 0, nodeBox);
+        const nx0 = nodeBox[0]!;
+        const ny0 = nodeBox[1]!;
+        const nx1 = nodeBox[3]!;
+        const ny1 = nodeBox[4]!;
         if (nx1 < winMinX || nx0 > winMaxX || ny1 < winMinY || ny0 > winMaxY) continue;
       }
       const read = source.readPoints(index);
@@ -200,9 +209,10 @@ export class GroundIndex {
       const positions = read.positions;
       for (let i = 0; i < read.count; i++) {
         const j = 3 * (read.start + i);
-        const sx = positions[j]! + ox;
-        const sy = positions[j + 1]! + oy;
-        const sz = positions[j + 2]! + (source.cloudOrigin[2] - source.sceneOrigin[2]);
+        frame.localToScene(positions[j]!, positions[j + 1]!, positions[j + 2]!, scenePt);
+        const sx = scenePt.x;
+        const sy = scenePt.y;
+        const sz = scenePt.z;
         const cx = ((sx - minX) / this.cell) | 0;
         const cy = ((sy - minY) / this.cell) | 0;
         if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) continue;

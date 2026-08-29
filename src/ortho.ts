@@ -12,6 +12,8 @@
  * cima. Guardar o mais alto é a mesma pergunta que a lente fez.
  */
 
+import type { CloudFrame } from "./object.js";
+
 export interface OrthoReadback {
   readonly positions: Float32Array | Int32Array;
   readonly start: number;
@@ -21,8 +23,8 @@ export interface OrthoReadback {
 
 export interface OrthoCloudContext {
   readonly cloudIndex: number;
-  readonly cloudOrigin: readonly [number, number, number];
-  readonly sceneOrigin: readonly [number, number, number];
+  /** Onde esta nuvem está na cena — ver {@link CloudFrame}. */
+  readonly frame: CloudFrame;
   readonly selection: Int32Array;
   readonly selectionCount: number;
   readPoints(index: number): OrthoReadback | undefined;
@@ -40,6 +42,9 @@ export interface OrthoSample {
   /** Metros por célula, nos dois eixos. */
   readonly scale: readonly [number, number];
 }
+
+/** Destino reutilizado: este laço corre por milhões de pontos. */
+const scenePt = { x: 0, y: 0, z: 0 };
 
 /** Rec. 601, a mesma que a foto vai usar — as duas têm de concordar. */
 const lumaOf = (r: number, g: number, b: number): number =>
@@ -71,10 +76,8 @@ export function orthoSampleClouds(
 
   for (const cloud of clouds) {
     if (cloudIndex !== undefined && cloud.cloudIndex !== cloudIndex) continue;
-    // Os buffers estão em local-da-nuvem; a cena é isso mais esta translação.
-    const ox = cloud.cloudOrigin[0] - cloud.sceneOrigin[0];
-    const oy = cloud.cloudOrigin[1] - cloud.sceneOrigin[1];
-    const oz = cloud.cloudOrigin[2] - cloud.sceneOrigin[2];
+    // Os buffers estão em local-da-nuvem; a `frame` é o que os leva à cena.
+    const frame = cloud.frame;
 
     for (let k = 0; k < cloud.selectionCount; k++) {
       const read = cloud.readPoints(cloud.selection[k]!);
@@ -89,11 +92,12 @@ export function orthoSampleClouds(
 
       for (let i = 0; i < read.count; i++) {
         const p = (read.start + i) * 3;
-        const gx = ((pos[p]! + ox - min[0]) * sx) | 0;
+        frame.localToScene(pos[p]!, pos[p + 1]!, pos[p + 2]!, scenePt);
+        const gx = ((scenePt.x - min[0]) * sx) | 0;
         if (gx < 0 || gx >= width) continue;
-        const gy = ((pos[p + 1]! + oy - min[1]) * sy) | 0;
+        const gy = ((scenePt.y - min[1]) * sy) | 0;
         if (gy < 0 || gy >= height) continue;
-        const z = pos[p + 2]! + oz;
+        const z = scenePt.z;
         const cell = gy * width + gx;
         if (z <= top[cell]!) continue;
         const c = (read.start + i) * per;

@@ -1,3 +1,4 @@
+import { CloudFrame } from "./object.js";
 import { describe, expect, it } from "vitest";
 import { orthoSampleClouds, type OrthoCloudContext } from "./ortho.js";
 
@@ -20,8 +21,7 @@ const cloudOf = (
   const col = new Uint8Array(colors.flatMap((c) => [c[0], c[1], c[2]]));
   return {
     cloudIndex: 0,
-    cloudOrigin: origin,
-    sceneOrigin: [0, 0, 0],
+    frame: new CloudFrame(origin, [0, 0, 0]),
     selection: Int32Array.from([0]),
     selectionCount: 1,
     readPoints: () => ({ positions: pos, start: 0, count: points.length, colors: col }),
@@ -132,8 +132,7 @@ describe("orthoSampleClouds", () => {
     const pos = new Float32Array([0.5, 0.5, 0]);
     const semCor: OrthoCloudContext = {
       cloudIndex: 0,
-      cloudOrigin: [0, 0, 0],
-      sceneOrigin: [0, 0, 0],
+      frame: new CloudFrame([0, 0, 0], [0, 0, 0]),
       selection: Int32Array.from([0]),
       selectionCount: 1,
       readPoints: () => ({ positions: pos, start: 0, count: 1 }),

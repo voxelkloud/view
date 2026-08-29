@@ -29,7 +29,8 @@ export type { EdlOptions, EdlPipeline, ResolvedEdlOptions } from "./edl.js";
 export { OctreeCut } from "./cut.js";
 export { BlockAllocator, ComputeRasterizer, ComputeSink } from "./sink-compute.js";
 export type { ComputeSinkOptions } from "./sink-compute.js";
-export { PointCloudObject3D } from "./object.js";
+export { CloudFrame, PointCloudObject3D } from "./object.js";
+export type { CloudPlacement, Vec3Out } from "./object.js";
 export { loadModelLayer } from "./model.js";
 export {
   BVH_NODE_STRIDE,

@@ -1,6 +1,7 @@
 import type { PerspectiveCamera } from "three";
 import { Ray, Vector3 } from "three";
 import { projectionFactorPerspective } from "./lod/metric.js";
+import type { CloudFrame } from "./object.js";
 
 export interface PickResult {
   /** CRS absoluto, float64. */
@@ -41,8 +42,14 @@ export interface PickReadback {
 
 interface PickCloudContext {
   readonly cloudIndex: number;
-  readonly cloudOrigin: readonly [number, number, number];
-  readonly sceneOrigin: readonly [number, number, number];
+  /**
+   * Onde esta nuvem está na cena — a translação de sempre, ou a semelhança que
+   * a traz de outro sistema de coordenadas. Substituiu o par
+   * `cloudOrigin`/`sceneOrigin` que estava aqui: as três conversões que este
+   * arquivo fazia à mão só valiam enquanto a relação fosse uma translação, e
+   * nada no código dizia isso.
+   */
+  readonly frame: CloudFrame;
   readonly selection: Int32Array;
   readonly selectionCount: number;
   node(index: number): PickNode | undefined;
@@ -52,16 +59,53 @@ interface PickCloudContext {
 const DEFAULT_MAX_DISTANCE_PX = 8;
 const point = new Vector3();
 const projected = new Vector3();
+/** Destinos reutilizados: este laço corre por milhões de pontos. */
+const scenePt = { x: 0, y: 0, z: 0 };
+const absPt = { x: 0, y: 0, z: 0 };
+const centrePt = { x: 0, y: 0, z: 0 };
+const nodeBox = new Float64Array(6);
 
-function sceneOffset(
-  cloudOrigin: readonly [number, number, number],
-  sceneOrigin: readonly [number, number, number],
-): [number, number, number] {
-  return [
-    cloudOrigin[0] - sceneOrigin[0],
-    cloudOrigin[1] - sceneOrigin[1],
-    cloudOrigin[2] - sceneOrigin[2],
-  ];
+/**
+ * O resultado de um acerto, montado num sítio só.
+ *
+ * Vivia duplicado — uma cópia no ramo "é o melhor até agora" e outra no
+ * desempate por profundidade — e as duas construíam as mesmas seis coisas a
+ * partir dos mesmos índices. Duas cópias de uma conversão de coordenadas são
+ * dois sítios para a corrigir e um para esquecer.
+ */
+function hit(
+  cloud: PickCloudContext,
+  read: PickReadback,
+  j: number,
+  i: number,
+  nodeIndex: number,
+  sx: number,
+  sy: number,
+  sz: number,
+  dist: number,
+): PickResult {
+  cloud.frame.sceneToAbs(sx, sy, sz, absPt);
+  const colors = read.colors;
+  const color =
+    colors === undefined
+      ? undefined
+      : ([colors[4 * j]!, colors[4 * j + 1]!, colors[4 * j + 2]!] as const);
+  const scalar = read.scalars === undefined ? undefined : Number(read.scalars[j]!);
+  return {
+    position: [absPt.x, absPt.y, absPt.z],
+    // Só quando as duas diferem. Numa nuvem que define a origem da cena e não
+    // tem colocação elas são o MESMO número, e devolver as duas faria quem lê
+    // supor que há ali uma distinção a fazer.
+    ...(absPt.x !== sx || absPt.y !== sy || absPt.z !== sz
+      ? { scenePosition: [sx, sy, sz] as [number, number, number] }
+      : {}),
+    cloudIndex: cloud.cloudIndex,
+    nodeIndex,
+    pointIndex: i,
+    screenDistancePx: dist,
+    ...(color !== undefined ? { color } : {}),
+    ...(scalar !== undefined ? { scalarValue: scalar } : {}),
+  };
 }
 
 function intersectsExpandedBox(
@@ -147,7 +191,7 @@ export function pickPoint(
       continue;
     }
 
-    const offset = sceneOffset(cloud.cloudOrigin, cloud.sceneOrigin);
+    const frame = cloud.frame;
 
     for (let k = 0; k < cloud.selectionCount; k++) {
       const nodeIndex = cloud.selection[k]!;
@@ -155,14 +199,17 @@ export function pickPoint(
       const read = cloud.readPoints(nodeIndex);
       if (node === undefined || read === undefined || read.count === 0) continue;
 
-      const nodeCentreX = (node.minX + node.maxX) * 0.5 - cloud.sceneOrigin[0];
-      const nodeCentreY = (node.minY + node.maxY) * 0.5 - cloud.sceneOrigin[1];
-      const nodeCentreZ = (node.minZ + node.maxZ) * 0.5 - cloud.sceneOrigin[2];
+      frame.absToScene(
+        (node.minX + node.maxX) * 0.5,
+        (node.minY + node.maxY) * 0.5,
+        (node.minZ + node.maxZ) * 0.5,
+        centrePt,
+      );
       const depthToCentre = Math.max(
         Math.hypot(
-          nodeCentreX - ray.origin.x,
-          nodeCentreY - ray.origin.y,
-          nodeCentreZ - ray.origin.z,
+          centrePt.x - ray.origin.x,
+          centrePt.y - ray.origin.y,
+          centrePt.z - ray.origin.z,
         ),
         1e-6,
       );
@@ -173,15 +220,19 @@ export function pickPoint(
       );
       if (!(proj > 0)) continue;
       const worldRadius = maxDistancePx / proj;
+      // A caixa do nó JÁ NA CENA. Sob rotação ela deixa de estar alinhada aos
+      // eixos, e `sceneBox` devolve o limite alinhado que a contém — maior,
+      // nunca menor, porque encolher aqui descartaria geometria em silêncio.
+      frame.sceneBox(node.minX, node.minY, node.minZ, node.maxX, node.maxY, node.maxZ, nodeBox);
       if (
         !intersectsExpandedBox(
           ray,
-          node.minX - cloud.sceneOrigin[0],
-          node.minY - cloud.sceneOrigin[1],
-          node.minZ - cloud.sceneOrigin[2],
-          node.maxX - cloud.sceneOrigin[0],
-          node.maxY - cloud.sceneOrigin[1],
-          node.maxZ - cloud.sceneOrigin[2],
+          nodeBox[0]!,
+          nodeBox[1]!,
+          nodeBox[2]!,
+          nodeBox[3]!,
+          nodeBox[4]!,
+          nodeBox[5]!,
           worldRadius,
         )
       ) {
@@ -190,9 +241,15 @@ export function pickPoint(
 
       for (let i = 0; i < read.count; i++) {
         const j = read.start + i;
-        const sx = read.positions[3 * j]! + offset[0];
-        const sy = read.positions[3 * j + 1]! + offset[1];
-        const sz = read.positions[3 * j + 2]! + offset[2];
+        frame.localToScene(
+          read.positions[3 * j]!,
+          read.positions[3 * j + 1]!,
+          read.positions[3 * j + 2]!,
+          scenePt,
+        );
+        const sx = scenePt.x;
+        const sy = scenePt.y;
+        const sz = scenePt.z;
         point.set(sx, sy, sz);
         const depth = (point.x - ray.origin.x) * ray.direction.x +
           (point.y - ray.origin.y) * ray.direction.y +
@@ -211,33 +268,7 @@ export function pickPoint(
         if (dist > maxDistancePx) continue;
 
         if (best === undefined || dist < best.screenDistancePx - 1e-6) {
-          const scene: [number, number, number] = [sx, sy, sz];
-          const abs: [number, number, number] = [
-            sx + cloud.sceneOrigin[0],
-            sy + cloud.sceneOrigin[1],
-            sz + cloud.sceneOrigin[2],
-          ];
-          const colors = read.colors;
-          const color =
-            colors === undefined
-              ? undefined
-              : ([colors[4 * j]!, colors[4 * j + 1]!, colors[4 * j + 2]!] as const);
-          const scalar =
-            read.scalars === undefined ? undefined : Number(read.scalars[j]!);
-          best = {
-            position: abs,
-            ...(cloud.sceneOrigin[0] !== 0 ||
-            cloud.sceneOrigin[1] !== 0 ||
-            cloud.sceneOrigin[2] !== 0
-              ? { scenePosition: scene }
-              : {}),
-            cloudIndex: cloud.cloudIndex,
-            nodeIndex,
-            pointIndex: i,
-            screenDistancePx: dist,
-            ...(color !== undefined ? { color } : {}),
-            ...(scalar !== undefined ? { scalarValue: scalar } : {}),
-          };
+          best = hit(cloud, read, j, i, nodeIndex, sx, sy, sz, dist);
           bestDepth = depth;
           continue;
         }
@@ -246,33 +277,7 @@ export function pickPoint(
           Math.abs(dist - best.screenDistancePx) <= 1e-6 &&
           depth < bestDepth
         ) {
-          const scene: [number, number, number] = [sx, sy, sz];
-          const abs: [number, number, number] = [
-            sx + cloud.sceneOrigin[0],
-            sy + cloud.sceneOrigin[1],
-            sz + cloud.sceneOrigin[2],
-          ];
-          const colors = read.colors;
-          const color =
-            colors === undefined
-              ? undefined
-              : ([colors[4 * j]!, colors[4 * j + 1]!, colors[4 * j + 2]!] as const);
-          const scalar =
-            read.scalars === undefined ? undefined : Number(read.scalars[j]!);
-          best = {
-            position: abs,
-            ...(cloud.sceneOrigin[0] !== 0 ||
-            cloud.sceneOrigin[1] !== 0 ||
-            cloud.sceneOrigin[2] !== 0
-              ? { scenePosition: scene }
-              : {}),
-            cloudIndex: cloud.cloudIndex,
-            nodeIndex,
-            pointIndex: i,
-            screenDistancePx: dist,
-            ...(color !== undefined ? { color } : {}),
-            ...(scalar !== undefined ? { scalarValue: scalar } : {}),
-          };
+          best = hit(cloud, read, j, i, nodeIndex, sx, sy, sz, dist);
           bestDepth = depth;
         }
       }
