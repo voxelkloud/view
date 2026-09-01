@@ -87,3 +87,18 @@ export function isWebGPUAvailable(): boolean {
 export const VOXELKLOUD_VIEW_VERSION = "0.0.0";
 
 export { orthoSampleClouds, type OrthoSample, type OrthoCloudContext } from "./ortho.js";
+/**
+ * The CPU-only half of `SplatSink`'s geometry — no `GPUDevice`, no octree
+ * dependency, so a consumer that has its own flat (non-tiled) Gaussian set
+ * can reuse the exact axis/sort math instead of re-deriving it. `LiveViewer`
+ * (apps/site) is the first: one capture's worth of Gaussians, parsed
+ * straight off a `.ply`, with no `DecodedPointData`/octree in sight.
+ */
+export {
+  applySortOrder,
+  cameraPositionSignature,
+  rotationColumns,
+  sortBackToFront,
+  sourceSplatVectorToZUp,
+} from "./sink-splat-geometry.js";
+export type { GatheredGeometry, SplatNodeGeometry } from "./sink-splat-geometry.js";

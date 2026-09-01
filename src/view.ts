@@ -92,6 +92,7 @@ import {
   Z_RANGE_OFF,
 } from "./sink-compute.js";
 import { PointsRasterizer, PointsSink } from "./sink-points.js";
+import { SplatSink } from "./sink-splat.js";
 import { PerNodeSink } from "./sink.js";
 import type { PointSink } from "./sink.js";
 
@@ -488,6 +489,14 @@ interface CloudHandle {
   readonly computeSink: ComputeSink | undefined;
   /** Set when this cloud draws through the WebGL 2 points rasteriser. */
   readonly pointsSink: PointsSink | undefined;
+  /**
+   * Set alongside `computeSink`, never instead of it — see `sink-splat.ts`'s
+   * own docstring. A node without gaussian extra dims (scale/rot/opacity)
+   * just no-ops on `attach`, so this is safe to hand every node of every
+   * compute-path cloud and it only ever holds data for the ones that are
+   * real Gaussian splats.
+   */
+  readonly splatSink: SplatSink | undefined;
   readonly reader: PointReader;
   readonly scratch: LodScratch;
   readonly selection: LodSelection;
@@ -1070,6 +1079,12 @@ export class PointCloudView {
     // dela. Sem isto, abrir uma segunda nuvem com um corte "model" activo
     // fatiaria a nuvem nova e nenhuma das outras.
     computeSink?.setClipPlanes(this.clipTarget === "all" ? this.clipPlanes : undefined);
+    // Mesma condição do computeSink (`useCompute`): o rasterizador de splat é
+    // WebGPU-only, e sem device não há pra onde desenhar. Qual nuvem de fato
+    // TEM gaussianas só se sabe nó a nó, dentro de `attach` — ver o campo.
+    const splatSink = useCompute
+      ? new SplatSink(this.device!, navigator.gpu.getPreferredCanvasFormat())
+      : undefined;
     const pointsSink =
       this.pointsRaster !== undefined && this.gl !== undefined
         ? new PointsSink(
@@ -1154,6 +1169,7 @@ export class PointCloudView {
       sink,
       computeSink,
       pointsSink,
+      splatSink,
       reader,
       scratch: createLodScratch(),
       selection: createLodSelection(this.lodOptions.maxNodes),
@@ -1193,6 +1209,34 @@ export class PointCloudView {
     return object;
   }
 
+  /**
+   * Posiciona a câmera quase de topo sobre `(cx, cy, cz)`, a uma distância
+   * proporcional a `span`.
+   *
+   * Quase — não exatamente de topo: `camera.up` fica em (0, 0, 1), e olhar
+   * EXATAMENTE ao longo do eixo `up` é o polo onde a órbita esférica dos
+   * `OrbitControls` perde a noção de azimute. Um resto de 10° de inclinação
+   * evita o polo sem se notar, e mantém a órbita normal (Z para cima) a
+   * funcionar desde o primeiro quadro — a alternativa, pôr `up` em (0,1,0)
+   * como a vista 2D faz, prenderia toda a navegação 3D depois disso ao eixo
+   * errado.
+   *
+   * O azimute é fixo a partir de -Y, e não mais a diagonal de antes
+   * (`cx+d, cy-d`): uma nuvem cujas paredes já estão nos eixos X/Y lê-se reta
+   * assim ao abrir; a diagonal antiga fazia até uma nuvem bem alinhada
+   * parecer torta.
+   */
+  private frameBox(cx: number, cy: number, cz: number, span: number): void {
+    const ELEVATION = (80 * Math.PI) / 180;
+    const r = span * 1.3;
+    this.camera.position.set(cx, cy - r * Math.cos(ELEVATION), cz + r * Math.sin(ELEVATION));
+    this.camera.lookAt(cx, cy, cz);
+    this.camera.near = Math.max(span / 5000, 0.1);
+    this.camera.far = span * 20;
+    this.camera.updateProjectionMatrix();
+    this.dirty = true;
+  }
+
   /** Frame the camera on a cloud's TIGHT bounds — never the cubic octree box,
    *  which on autzen is 22x taller than the data and would aim at empty sky. */
   frameCloud(index = 0): void {
@@ -1206,17 +1250,8 @@ export class PointCloudView {
     h.object.frame().sceneBox(
       b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], box,
     );
-    const cx = (box[0]! + box[3]!) / 2;
-    const cy = (box[1]! + box[4]!) / 2;
-    const cz = (box[2]! + box[5]!) / 2;
     const span = Math.max(box[3]! - box[0]!, box[4]! - box[1]!, box[5]! - box[2]!);
-    const d = span * 0.9;
-    this.camera.position.set(cx + d, cy - d, cz + d * 0.6);
-    this.camera.lookAt(cx, cy, cz);
-    this.camera.near = Math.max(span / 5000, 0.1);
-    this.camera.far = span * 20;
-    this.camera.updateProjectionMatrix();
-    this.dirty = true;
+    this.frameBox((box[0]! + box[3]!) / 2, (box[1]! + box[4]!) / 2, (box[2]! + box[5]!) / 2, span);
   }
 
   /**
@@ -1257,21 +1292,12 @@ export class PointCloudView {
   frameClouds(): void {
     const b = this.allCloudsBox();
     if (b === undefined) return;
-    const cx = (b.min[0] + b.max[0]) / 2;
-    const cy = (b.min[1] + b.max[1]) / 2;
-    const cz = (b.min[2] + b.max[2]) / 2;
     const span = Math.max(
       b.max[0] - b.min[0],
       b.max[1] - b.min[1],
       b.max[2] - b.min[2],
     );
-    const d = span * 0.9;
-    this.camera.position.set(cx + d, cy - d, cz + d * 0.6);
-    this.camera.lookAt(cx, cy, cz);
-    this.camera.near = Math.max(span / 5000, 0.1);
-    this.camera.far = span * 20;
-    this.camera.updateProjectionMatrix();
-    this.dirty = true;
+    this.frameBox((b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2, span);
   }
 
   /** Onde {@link frameClouds} aponta — o alvo de órbita com várias nuvens. */
@@ -1617,6 +1643,32 @@ export class PointCloudView {
    * two apart in the UI: a control that silently switches between them would
    * reintroduce the misleading answer the decision exists to prevent.
    */
+  /**
+   * Cortar UMA nuvem, sem tocar nas outras.
+   *
+   * Existe para a cortina entre épocas: o levantamento antigo de um lado do
+   * ecrã, o novo do outro, ambos na mesma câmera. Duas nuvens com planos
+   * OPOSTOS dão isso, e não há outra forma de o conseguir com um só canvas.
+   *
+   * O sink sempre soube cortar por nuvem — {@link setClipPlanes} é que aplicava
+   * o mesmo plano a todas num laço. Isto expõe o que já lá estava.
+   *
+   * PRECEDÊNCIA, e é preciso sabê-la: uma chamada a {@link setClipPlanes}
+   * DEPOIS desta reescreve o plano de todas as nuvens e apaga o que aqui foi
+   * posto. É a ordem certa — o corte do projeto é global e deve ganhar — e quem
+   * usa a cortina reaplica-a por quadro na mesma, porque o plano dela depende
+   * da câmera.
+   */
+  setCloudClipPlanes(cloudIndex: number, planes: Float32Array | undefined): void {
+    const h = this.clouds[cloudIndex];
+    if (h === undefined) return;
+    // Só o caminho de COMPUTE, tal como {@link setClipPlanes}: o rasterizador
+    // WebGL2 de recurso não sabe cortar, e fingir que sabe deixaria a cortina a
+    // não fazer nada numa máquina sem WebGPU em vez de o dizer.
+    h.computeSink?.setClipPlanes(planes);
+    this.dirty = true;
+  }
+
   setClipPlanes(planes: Float32Array | undefined, target: ClipTarget = "all"): void {
     this.clipPlanes = planes;
     this.clipTarget = target;
@@ -2231,12 +2283,14 @@ export class PointCloudView {
       // mostrar é um quadro — não um novo download de centenas de megabytes.
       h.sink.setVisible(drawn.indices, h.hidden ? 0 : drawn.count);
       h.sink.commit();
+      h.splatSink?.setVisible(drawn.indices, h.hidden ? 0 : drawn.count);
+      h.splatSink?.commit();
 
       h.prevMinSpacing = h.selection.minPointSpacingWorld;
       visibleNodes += h.selection.count;
       visiblePoints += h.selection.points;
       residentNodes += h.sink.nodeCount;
-      residentBytes += h.sink.residentBytes;
+      residentBytes += h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0);
       loading += h.inFlight.size;
       if (h.sink instanceof ArenaSink) slabs += h.sink.slabCount;
       maxLevel = Math.max(maxLevel, h.selection.maxSelectedLevel);
@@ -2271,18 +2325,29 @@ export class PointCloudView {
         // pass: mutual occlusion with the points, because the fragment shader
         // reads their depth buffer directly.
         const overlay = this.overlayFor();
+        // Mesma pass que o overlay, pela mesma razão: `SplatSink.draw` lê o
+        // depth do resolve como storage read-only, o que só é permitido numa
+        // pass separada da que o escreveu — ver o comentário de `end()` em
+        // `sink-compute.ts`.
+        const splatClouds = this.clouds.filter((h) => (h.splatSink?.nodeCount ?? 0) > 0);
         this.raster.end(
           enc,
-          overlay === undefined
+          overlay === undefined && splatClouds.length === 0
             ? undefined
-            : (pass) =>
-                overlay.record(
-                  pass,
-                  this.camera,
-                  this.raster!.depth!,
-                  this.drawSize.x,
-                  this.drawSize.y,
-                ),
+            : (pass) => {
+                overlay?.record(pass, this.camera, this.raster!.depth!, this.drawSize.x, this.drawSize.y);
+                for (const h of splatClouds) {
+                  h.object.updateMatrixWorld();
+                  h.splatSink!.draw(
+                    pass,
+                    this.camera,
+                    h.object.matrixWorld,
+                    this.raster!.depth!,
+                    this.drawSize.x,
+                    this.drawSize.y,
+                  );
+                }
+              },
         );
       }
     }
@@ -2534,7 +2599,7 @@ export class PointCloudView {
         });
     }
 
-    if (h.sink.residentBytes > this.maxResidentBytes) this.evict(h);
+    if (h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0) > this.maxResidentBytes) this.evict(h);
   }
 
   /**
@@ -2583,6 +2648,9 @@ export class PointCloudView {
           p.data.attributesByName.get(CLASS_ATTRIBUTE)?.array,
         );
       const bytes = h.sink.attach(p.index, p.data, pitch, p.level);
+      // No mesmo pé, não `bytes > 0`: um nó pode ser gaussiano E residente no
+      // sink normal ao mesmo tempo — são desenhos separados, não um `else`.
+      h.splatSink?.attach(p.index, p.data, pitch, p.level);
       if (bytes > 0) {
         h.resident.add(p.index);
         staged += bytes;
@@ -2595,7 +2663,7 @@ export class PointCloudView {
       }
     }
     h.pending.splice(0, n);
-    this.stats.residentPoints = h.sink.residentPoints;
+    this.stats.residentPoints = h.sink.residentPoints + (h.splatSink?.residentPoints ?? 0);
     this.stats.pendingAttach = h.pending.length;
     if (h.pending.length > 0) this.dirty = true;
   }
@@ -2610,8 +2678,9 @@ export class PointCloudView {
     candidates.sort((a, b) => a[1] - b[1]);
     const target = this.maxResidentBytes * 0.85;
     for (const [i] of candidates) {
-      if (h.sink.residentBytes <= target) break;
+      if (h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0) <= target) break;
       h.sink.detach(i);
+      h.splatSink?.detach(i);
       h.resident.delete(i);
     }
   }
@@ -2633,6 +2702,7 @@ export class PointCloudView {
       h.sink.dispose();
       h.cut.dispose();
       h.computeSink?.dispose();
+      h.splatSink?.dispose();
       h.material?.dispose();
       this.scene.remove(h.object);
     }
