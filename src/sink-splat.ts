@@ -1,6 +1,7 @@
 import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Matrix4, PerspectiveCamera } from "three";
 import { toZeroToOneDepth } from "./clip.js";
+import { Z_RANGE_OFF } from "./sink-compute.js";
 import {
   applySortOrder,
   buildSplatNodeGeometry,
@@ -27,7 +28,11 @@ export interface SplatSinkOptions {
 }
 
 const CORNER_VERTICES = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
-const UNIFORM_BYTES = 80; // mat4x4<f32> (64) + screenW/screenH/ignoreDepth/_pad (16)
+// mat4x4<f32> (64) + screenW/screenH/ignoreDepth/_pad (16) +
+// zLo/zHi/clipCount/_pad2 (16) + clip: array<vec4<f32>, 4> (64) — see
+// `SPLAT_WGSL`'s `Uniforms` struct, which this must match field-for-field.
+const UNIFORM_BYTES = 160;
+const MAX_CLIP_PLANES = 4;
 
 /**
  * A {@link PointSink} that draws real alpha-blended Gaussian splats — the
@@ -66,6 +71,18 @@ export class SplatSink implements PointSink {
 
   private visibleIndices: readonly number[] = [];
   private lastSortSignature = "";
+
+  /** Cloud-local, same convention `ComputeSink`/`PerNodeSink` use — the
+   * caller (`PointCloudView.setZRange`) already converts scene Z before
+   * calling. */
+  private zLo = Z_RANGE_OFF[0];
+  private zHi = Z_RANGE_OFF[1];
+  /** SCENE-space plane equations, same convention as `ComputeSink.setClipPlanes` —
+   * `PointCloudView.setClipPlanes` broadcasts the same array to every cloud's
+   * sink unconverted; each sink rebiases to its own cloud-local frame at draw
+   * time (see DEC-B6 in `sink-compute.ts`), because the translation differs
+   * per cloud. */
+  private clipPlanes: Float32Array | undefined;
 
   private readonly pipeline: GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
@@ -215,6 +232,18 @@ export class SplatSink implements PointSink {
     this.visibleIndices = Array.from(indices.subarray(0, count));
   }
 
+  /** Ver {@link PointCloudView.setZRange} — Z local da nuvem, já convertido. */
+  setZRange(lo: number, hi: number): void {
+    this.zLo = lo;
+    this.zHi = hi;
+  }
+
+  /** Ver `ComputeSink.setClipPlanes` — planos locais da nuvem, no máximo
+   * {@link MAX_CLIP_PLANES}; o resto é ignorado silenciosamente, tal como lá. */
+  setClipPlanes(planes: Float32Array | undefined): void {
+    this.clipPlanes = planes === undefined || planes.length === 0 ? undefined : planes;
+  }
+
   /** Nothing to flush: geometry is built once at `attach` time (CPU-only),
    * and the GPU upload happens in `draw`, gated on the camera actually
    * having moved — same reasoning as `PerNodeSink.commit`. */
@@ -285,6 +314,28 @@ export class SplatSink implements PointSink {
     f[16] = width;
     f[17] = height;
     f[18] = 0; // ignoreDepth
+    f[20] = this.zLo;
+    f[21] = this.zHi;
+    const planes = this.clipPlanes;
+    const nPlanes = planes === undefined ? 0 : Math.min(MAX_CLIP_PLANES, planes.length >> 2);
+    f[22] = nPlanes;
+    // Words 24..40: `clip`, rebiased from scene space to this cloud's local
+    // frame — DEC-B6 in sink-compute.ts. `center` (the vertex attribute this
+    // is tested against) is cloud-local, so the plane distance needs the same
+    // translation-only correction: dot(n, p+t) + d becomes dot(n, p) + (d +
+    // dot(n, t)).
+    const e = modelMatrix.elements;
+    for (let i = 0; i < nPlanes; i++) {
+      const nx = planes![i * 4]!;
+      const ny = planes![i * 4 + 1]!;
+      const nz = planes![i * 4 + 2]!;
+      const d = planes![i * 4 + 3]!;
+      const k = 24 + i * 4;
+      f[k] = nx;
+      f[k + 1] = ny;
+      f[k + 2] = nz;
+      f[k + 3] = d + nx * e[12]! + ny * e[13]! + nz * e[14]!;
+    }
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniform);
 
     pass.setPipeline(this.pipeline);

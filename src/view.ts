@@ -40,7 +40,12 @@ import type { PointMaterialOptions } from "./material-options.js";
 // `NodeMaterial` out of TSL, so importing it for its value is what pulled the
 // whole WebGPU build into bundles that only ever drew through raw WebGL 2.
 import type { PointCloudMaterial, createPointMaterial } from "./material.js";
-import { extractFrustumPlanes } from "./lod/frustum.js";
+import { extractFrustumPlanes, intersectsAabb } from "./lod/frustum.js";
+import {
+  MAX_LOAD_ATTEMPTS,
+  nextRetryFrame,
+  shouldAbortFetch,
+} from "./stream-policy.js";
 import type { DepthRange } from "./lod/frustum.js";
 import { suggestNearFar } from "./lod/metric.js";
 import {
@@ -92,6 +97,17 @@ import {
   Z_RANGE_OFF,
 } from "./sink-compute.js";
 import { PointsRasterizer, PointsSink } from "./sink-points.js";
+import type { GpuTimings } from "./gpu-timing.js";
+import {
+  QUALITY_LEVELS,
+  QualityController,
+  DEFAULT_QUALITY_INDEX,
+  ceilingForOptions,
+  clampIndex,
+  initialQualityIndex,
+  resolveQualityIndex,
+} from "./quality.js";
+import type { DeviceProfile, QualityLevel } from "./quality.js";
 import { SplatSink } from "./sink-splat.js";
 import { PerNodeSink } from "./sink.js";
 import type { PointSink } from "./sink.js";
@@ -293,6 +309,30 @@ export interface ViewStats {
    */
   lastError: string | undefined;
   /**
+   * Node fetches cancelled since the view was created, cumulative.
+   *
+   * Almost all of them are the frustum tier doing its job, and the number
+   * worth watching is this one against `loading`: a cancel rate near the
+   * dispatch rate means the camera is outrunning the pipe, and the answer is a
+   * smaller `pointBudget` or a coarser `targetScreenError`, not more slots.
+   */
+  abortedLoads: number;
+  /**
+   * Nodes given up on after every retry — each one a hole in the picture that
+   * will not fill. Non-zero here is the first thing to check when a region of
+   * a cloud stays empty; `lastError` says why the first one went.
+   */
+  failedNodes: number;
+  /**
+   * True when eviction had nothing to free but the CURRENT selection, so
+   * `residentMB` is over `maxResidentBytes` and staying there.
+   *
+   * Not a failure — it is the honest report that the working set does not fit
+   * the budget. The alternative is evicting what is about to be drawn, which
+   * is a hole in this frame to save memory for the next one.
+   */
+  evictionStalled: boolean;
+  /**
    * Which constraint stopped refinement. `"error"` means the target spacing was
    * met — the good case. The reference has no such field, which is why nobody
    * noticed its quality knob was inert at the shipped defaults.
@@ -337,6 +377,90 @@ export interface PointCloudViewOptions {
    * Passed straight through to the reader factory `addCloud` was given.
    */
   readonly decompress?: NodeDecompress;
+  /**
+   * How many workers a driver may decode node payloads on. `false` keeps every
+   * decode on the main thread.
+   *
+   * Left alone it is the driver's own default, which for COPC is
+   * `min(4, hardwareConcurrency - 1)`. The measurement behind that default:
+   * laszip decode of a point format 6/7/8 record runs at roughly 0.5 million
+   * points a second, so a 100k-point node is ~190 ms of SYNCHRONOUS work, and
+   * with twelve fetches in flight several of those land in one frame. Filling
+   * a 3M budget costs about six seconds of blocked main thread — delivered as
+   * jank, not as a pause, because it arrives in 50-200 ms pieces spread across
+   * the load.
+   *
+   * A driver that decodes inline ignores this, and one that cannot start a
+   * worker falls back to inline rather than failing. Set `false` to measure
+   * the two paths against each other.
+   */
+  readonly decodeWorkers?: number | false;
+  /**
+   * Make the compute rasteriser dispatch over DRAWN POINTS rather than over
+   * resident slots. Default off.
+   *
+   * What it fixes: the two compute passes launch one thread per slot below the
+   * allocator's extent, and that extent is the session's peak residency rather
+   * than what is on screen. Nodes stay resident on purpose — re-fetching them
+   * over a thin uplink costs far more than holding them — so a view that has
+   * orbited a large cloud can be launching several times more threads than it
+   * has points to draw, twice a frame, for ever.
+   *
+   * OFF BY DEFAULT because it has never drawn a frame: it was written and
+   * unit-tested on a machine with no WebGPU device. The CPU half — the block
+   * table every thread maps itself through — is covered by tests; the shader
+   * half is not. Turn it on, check the image against the default path, and
+   * read `dispatchPoints` against `residentPoints` in the sink.
+   */
+  readonly compactDispatch?: boolean;
+  /**
+   * Automatic quality, the way a video player does it. ON by default.
+   *
+   * `"auto"` measures the interval between presented frames and moves along
+   * {@link QUALITY_LEVELS} — render scale, point budget and screen error
+   * together — until the renderer is making the display's refresh rate. A
+   * level name or index pins one rung and stops measuring. `false` leaves
+   * every knob exactly where the caller put it.
+   *
+   * IT CANNOT COST YOU MORE THAN YOU ASKED FOR. The ceiling is whatever `lod`
+   * you passed, resolved to a rung: name a `pointBudget` and auto will never
+   * exceed it. Pass no `lod` at all and the ceiling is one rung above the
+   * library defaults — enough for a workstation to be worth having, short of
+   * the rung whose budget would quadruple what a page pulls over the network
+   * on the strength of a frame-rate measurement that says nothing about the
+   * network.
+   *
+   * Going DOWN has no such limit, and that is the half that matters: the
+   * defaults in this library were calibrated on a machine holding 59.9 fps at
+   * a 3M budget, and the same settings on an integrated GPU at a 2x device
+   * pixel ratio are drawing four times the fragments with a fraction of the
+   * fill rate.
+   */
+  readonly quality?: "auto" | QualityLevel["name"] | number | false;
+  /**
+   * Time the GPU passes with `timestamp-query`. Off by default.
+   *
+   * The only instrument in this library that can see inside a frame that made
+   * vsync — which is most frames, and every frame worth optimising. Wall clock
+   * cannot: a splat-size sweep from 2 to 12 pixels, a 40-fold change in
+   * covered pixels, reads 16.7 ms at every stop.
+   *
+   * Costs a query set, a buffer map every thirty frames, and nothing on the
+   * frames between. Read it from {@link gpuTimings}. Silently inert on a device
+   * or a browser without the feature, which is the right failure for something
+   * nothing depends on.
+   */
+  readonly gpuTiming?: boolean;
+  /** Frames between timing readbacks when {@link gpuTiming} is on. Default 30. */
+  readonly gpuTimingEvery?: number;
+  /**
+   * Called whenever the rung changes, including the first time it is set.
+   *
+   * The UI that shows "Automático (Média)" reads this. It fires on the frame
+   * the change is applied, not a frame later, so a menu cannot show the rung
+   * the viewer has just left.
+   */
+  readonly onQualityChange?: (level: QualityLevel, index: number, auto: boolean) => void;
   /**
    * How point data reaches the GPU.
    *
@@ -402,16 +526,38 @@ export interface PointCloudViewOptions {
    */
   readonly onDeviceLost?: (info: DeviceLostInfo) => void;
   /**
-   * Cancel an in-flight node fetch once the camera has moved past it and the
-   * fetch queue is saturated. Default `true`.
+   * Cancel an in-flight node fetch once the SCHEDULER has stopped selecting it
+   * and the fetch queue is saturated. Default `false`.
    *
-   * Default `false`, and the default is measured rather than chosen. Under a
-   * panning camera it saves 0.58 MB of 105.79 — 0.5% — and in an A/B on a quiet
-   * host it cost ~64 ms of INP (320/344 on, 280/256 off). Trading the one Core
-   * Web Vital already behind for half a percent of bytes is a bad deal, so it
-   * ships off and stays available for a workload where the bytes matter more.
+   * Off, and the default is measured rather than chosen. The node is still in
+   * front of the camera — it was declined at the error threshold, not culled —
+   * and under a panning camera those come back. Cancelling them saves 0.58 MB
+   * of 105.79 (0.5%) and cost ~64 ms of INP in an A/B on a quiet host (320/344
+   * on, 280/256 off). Trading the one Core Web Vital already behind for half a
+   * percent of bytes is a bad deal.
+   *
+   * NOT the same decision as {@link abortOutsideFrustum}, which is on by
+   * default because it acts on a fact rather than on a guess.
    */
   readonly abortSuperseded?: boolean;
+  /**
+   * Cancel an in-flight node fetch once the node's box leaves the frustum.
+   * Default `true`.
+   *
+   * The bytes of an off-screen node cannot change a pixel, this frame or any
+   * frame until the camera turns back — so the fetch is holding a slot, and on
+   * a thin uplink a share of the pipe, that a node ON screen is waiting for.
+   * That is the whole mechanism behind "it loaded everything except the part I
+   * was looking at": a fast orbit leaves twelve fetches in flight for geometry
+   * that is now behind the camera, and the visible frontier queues behind them.
+   *
+   * Unlike {@link abortSuperseded} this is not a prediction about what the
+   * camera will do next, which is why it ships on and why it waits two frames
+   * rather than eight — `ABORT_OUTSIDE_FRAMES` in `stream-policy.ts`, where
+   * the hysteresis is explained. A node that comes back into view is
+   * re-dispatched in priority order on the frame it does.
+   */
+  readonly abortOutsideFrustum?: boolean;
   /**
    * Node liveness flips the arena may perform per frame. Default 128.
    *
@@ -513,7 +659,23 @@ interface CloudHandle {
   visible: Int32Array;
   replaceScratch: ReplaceScratch;
   readonly inFlight: Map<number, AbortController>;
+  /**
+   * Nodes given up on after {@link MAX_LOAD_ATTEMPTS}. TERMINAL, and it has to
+   * be earned: a node in here is a permanent hole in the picture.
+   */
   readonly failed: Set<number>;
+  /** Load attempts so far, per node. Cleared the moment one succeeds. */
+  readonly attempts: Map<number, number>;
+  /**
+   * Frame at which a failed node may be dispatched again.
+   *
+   * Exists because the failures that leave holes are mostly TRANSIENT — a 503
+   * from one CDN edge, a connection dropped mid-flight, a sink with no room
+   * until the next eviction — and blacklisting on the first one leaves a
+   * region of the cloud that never loads again however long the user stares at
+   * it. Backed off rather than retried per frame; see `retryDelayFrames`.
+   */
+  readonly retryAt: Map<number, number>;
   /**
    * Decoded nodes waiting to be staged into the sink.
    *
@@ -650,6 +812,9 @@ export class PointCloudView {
     loading: 0,
     maxLevel: 0,
     lastError: undefined,
+    abortedLoads: 0,
+    failedNodes: 0,
+    evictionStalled: false,
     limitedBy: "complete",
     achievedScreenError: 0,
   };
@@ -670,6 +835,7 @@ export class PointCloudView {
   private readonly maxResidentBytes: number;
   private readonly maxAttachBytes: number;
   private readonly abortSuperseded: boolean;
+  private readonly abortOutsideFrustum: boolean;
   private readonly movingBudgetScale: number;
   private readonly movingSettleFrames: number;
   /** Camera world matrix as of the last frame, to detect motion without an API. */
@@ -721,6 +887,18 @@ export class PointCloudView {
   get deviceLost(): DeviceLostInfo | undefined {
     return this.lostInfo;
   }
+  /**
+   * What the GPU spent on each pass, in milliseconds, or `undefined` when
+   * {@link PointCloudViewOptions.gpuTiming} was off or unavailable.
+   *
+   * Averaged over samples taken every thirtieth frame, so it lags the work it
+   * describes by a few frames and is useless for anything that steers. It is
+   * for answering "where did the frame go", which nothing else here can.
+   */
+  get gpuTimings(): GpuTimings | undefined {
+    return this.raster?.timings;
+  }
+
   /** First few uncaptured GPU errors, in order. Validation failures land here. */
   readonly gpuErrors: string[] = [];
   /**
@@ -744,8 +922,35 @@ export class PointCloudView {
   /** The device and swapchain the compute path draws into. Ours, not three's. */
   private device: GPUDevice | undefined;
   private gpuContext: GPUCanvasContext | undefined;
-  /** What `renderer.getPixelRatio()` used to answer. */
+  /** The EFFECTIVE ratio: what the caller asked for, times the render scale. */
   private pixelRatio = 1;
+  /**
+   * What the caller last passed to {@link setSize}, and the ceiling the render
+   * scale multiplies.
+   *
+   * Kept apart from {@link pixelRatio} so the two owners never fight. The page
+   * owns the CSS box and the device pixel ratio, through a ResizeObserver it
+   * calls whenever the layout moves; the quality controller owns the fraction
+   * of that ratio actually rendered. Collapsing them into one number means the
+   * next resize silently undoes the last quality decision — which presents as
+   * a viewer that is smooth until you drag the window, and never again.
+   */
+  private requestedPixelRatio = 1;
+  private cssWidth = 1;
+  private cssHeight = 1;
+  /** 1 unless the quality ladder is asking for less than the full ratio. */
+  private renderScale = 1;
+  /** Undefined when the caller pinned a level or turned the ladder off. */
+  private auto: QualityController | undefined;
+  /** The rung in force, whether auto chose it or the caller pinned it. */
+  private qualityIndex = -1;
+  /** Timestamp of the previous `renderFrame`, for the presented interval. */
+  private lastFrameAt = 0;
+  private get onQuality():
+    | ((level: QualityLevel, index: number, auto: boolean) => void)
+    | undefined {
+    return this.options.onQualityChange;
+  }
   private overlay: OverlayRenderer | undefined;
   /** What actually drew, after capability resolution. Public so a caller can
    *  see that a compute request fell back rather than guess from a frame time. */
@@ -782,6 +987,7 @@ export class PointCloudView {
     this.maxResidentBytes = options.maxResidentBytes ?? 512 * 1024 * 1024;
     this.maxAttachBytes = options.maxAttachBytesPerFrame ?? 8 * 1024 * 1024;
     this.abortSuperseded = options.abortSuperseded ?? false;
+    this.abortOutsideFrustum = options.abortOutsideFrustum ?? true;
     this.movingBudgetScale = Math.min(Math.max(options.movingBudgetScale ?? 1, 0.05), 1);
     this.movingSettleFrames = Math.max(options.movingSettleFrames ?? 6, 1);
   }
@@ -823,11 +1029,18 @@ export class PointCloudView {
         // budget past ~11M points overruns on the position buffer alone. The
         // adapter almost always offers more — ask for all of it, and let the
         // sink clamp its capacity to whatever the device actually granted.
+        // `timestamp-query` is OPTIONAL and asked for only when the caller
+        // wants it: a required feature the adapter lacks makes `requestDevice`
+        // reject outright, which would turn a diagnostic into a viewer that
+        // does not open.
+        const wantsTiming =
+          this.options.gpuTiming === true && adapter?.features.has("timestamp-query") === true;
         const device = await adapter?.requestDevice({
           requiredLimits: {
             maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
             maxBufferSize: adapter.limits.maxBufferSize,
           },
+          ...(wantsTiming ? { requiredFeatures: ["timestamp-query" as const] } : {}),
         });
         if (adapter !== null && adapter !== undefined) {
           // `info` is a plain object on Chrome and absent elsewhere; spread
@@ -876,6 +1089,14 @@ export class PointCloudView {
             this.raster = new ComputeRasterizer(device, ctx, format, {
               background: bg,
               warnings: this.gpuWarnings,
+              ...(this.options.gpuTiming === true
+                ? {
+                    timing: true,
+                    ...(this.options.gpuTimingEvery !== undefined
+                      ? { timingEvery: this.options.gpuTimingEvery }
+                      : {}),
+                  }
+                : {}),
               ...edlOpts,
             });
             this.rasterizer = "compute";
@@ -955,7 +1176,30 @@ export class PointCloudView {
     }
 
     this.initialized = true;
+    // LAST, because every signal it reads is decided above: which rasteriser
+    // won, and what the adapter admitted to being. Seeding quality before this
+    // point would probe a device that does not exist yet and always answer
+    // with the default rung.
+    this.startQuality();
     this.dirty = true;
+  }
+
+  /**
+   * Put the quality option into force, once, at the end of `init`.
+   *
+   * THE DEFAULT DEPENDS ON WHETHER THE CALLER TUNED ANYTHING. With no `lod` it
+   * is `"auto"`: nobody expressed an opinion, and the honest thing is to fit
+   * the machine. With an `lod` it is OFF, because someone who set a budget and
+   * a screen error by hand has already answered this question, and an
+   * automatic setting that rounds their 5,000,000 down to the ladder's nearest
+   * 3,000,000 would be a regression wearing a feature's clothes. They can still
+   * ask for `"auto"` explicitly, and then the ceiling applies.
+   */
+  private startQuality(): void {
+    const asked = this.options.quality;
+    const mode = asked ?? (this.options.lod === undefined ? "auto" : false);
+    if (mode === false) return;
+    this.setQuality(mode);
   }
 
   /**
@@ -1007,6 +1251,9 @@ export class PointCloudView {
       computeBounds: true,
       ...(this.options.decompress !== undefined
         ? { decompress: this.options.decompress }
+        : {}),
+      ...(this.options.decodeWorkers !== undefined
+        ? { decodeWorkers: this.options.decodeWorkers }
         : {}),
       ...pointDecodeSelection(source, scalarAttribute),
     });
@@ -1071,6 +1318,9 @@ export class PointCloudView {
             elevationRange: resolved.elevationRange,
             scalarRange: resolved.scalarRange,
             background: this.options.background ?? [0, 0, 0],
+            ...(this.options.compactDispatch !== undefined
+              ? { compactDispatch: this.options.compactDispatch }
+              : {}),
           },
           scalarAttribute,
         )
@@ -1192,6 +1442,8 @@ export class PointCloudView {
       replaceScratch: createReplaceScratch(0),
       inFlight: new Map(),
       failed: new Set(),
+      attempts: new Map(),
+      retryAt: new Map(),
       pending: [],
       queued: new Set(),
       prevMinSpacing: pitchOf(hierarchy, hierarchy.root.index, 0),
@@ -1662,10 +1914,11 @@ export class PointCloudView {
   setCloudClipPlanes(cloudIndex: number, planes: Float32Array | undefined): void {
     const h = this.clouds[cloudIndex];
     if (h === undefined) return;
-    // Só o caminho de COMPUTE, tal como {@link setClipPlanes}: o rasterizador
-    // WebGL2 de recurso não sabe cortar, e fingir que sabe deixaria a cortina a
-    // não fazer nada numa máquina sem WebGPU em vez de o dizer.
+    // COMPUTE e SPLAT, tal como {@link setClipPlanes}: o rasterizador WebGL2
+    // de recurso não sabe cortar, e fingir que sabe deixaria a cortina a não
+    // fazer nada numa máquina sem WebGPU em vez de o dizer.
     h.computeSink?.setClipPlanes(planes);
+    h.splatSink?.setClipPlanes(planes);
     this.dirty = true;
   }
 
@@ -1676,7 +1929,10 @@ export class PointCloudView {
     // include. The points are cut only when the section is theirs too.
     this.overlay?.setClipPlanes(planes);
     const forPoints = target === "all" ? planes : undefined;
-    for (const h of this.clouds) h.computeSink?.setClipPlanes(forPoints);
+    for (const h of this.clouds) {
+      h.computeSink?.setClipPlanes(forPoints);
+      h.splatSink?.setClipPlanes(forPoints);
+    }
     this.dirty = true;
   }
 
@@ -1748,6 +2004,7 @@ export class PointCloudView {
     }
     h.computeSink?.setZRange(lo, hi);
     h.pointsSink?.setZRange(lo, hi);
+    h.splatSink?.setZRange(lo, hi);
     this.dirty = true;
   }
 
@@ -2120,6 +2377,24 @@ export class PointCloudView {
   }
 
   setSize(width: number, height: number, pixelRatio = 1): void {
+    this.cssWidth = width;
+    this.cssHeight = height;
+    this.requestedPixelRatio = pixelRatio;
+    this.applySize();
+  }
+
+  /**
+   * Push the CSS box and the effective ratio at whichever backend owns them.
+   *
+   * Separate from {@link setSize} because the render scale changes without the
+   * layout changing, and the layout changes without the render scale changing.
+   */
+  private applySize(): void {
+    const width = this.cssWidth;
+    const height = this.cssHeight;
+    // Never below a quarter: past that the picture is not lower quality, it is
+    // a different picture, and no frame rate is worth it.
+    const pixelRatio = Math.max(0.25, this.requestedPixelRatio * this.renderScale);
     this.pixelRatio = pixelRatio;
     if (this.threeRenderer !== undefined) {
       this.threeRenderer.setPixelRatio(pixelRatio);
@@ -2140,6 +2415,90 @@ export class PointCloudView {
 
   invalidate(): void {
     this.dirty = true;
+  }
+
+  /**
+   * The rung in force, and whether anything is still choosing it.
+   *
+   * `index` addresses {@link QUALITY_LEVELS}. `auto` is false once a caller
+   * has pinned a level, which is also the moment measurement stops.
+   */
+  get quality(): { readonly index: number; readonly level: QualityLevel; readonly auto: boolean } {
+    const index = this.qualityIndex < 0 ? DEFAULT_QUALITY_INDEX : this.qualityIndex;
+    return { index, level: QUALITY_LEVELS[index]!, auto: this.auto !== undefined };
+  }
+
+  /**
+   * Pin a rung, or hand control back to the measurement.
+   *
+   * `"auto"` restarts the controller FROM THE RUNG NOW IN FORCE rather than
+   * from the device guess. Someone who dropped to a low level by hand and then
+   * switched back to automatic has told us something about this machine that
+   * no probe could; throwing it away and starting from the guess would jump
+   * the picture and then walk it back down.
+   */
+  setQuality(quality: "auto" | QualityLevel["name"] | number): void {
+    if (quality === "auto") {
+      const from = this.qualityIndex < 0 ? this.initialIndex() : this.qualityIndex;
+      this.auto = new QualityController({
+        startIndex: from,
+        maxIndex: ceilingForOptions(this.options.lod),
+      });
+      this.applyQuality(this.auto.current, true);
+      return;
+    }
+    this.auto = undefined;
+    this.applyQuality(resolveQualityIndex(quality), false);
+  }
+
+  /** Where the device probe says to start. Also used to seed a restart. */
+  private initialIndex(): number {
+    const profile: DeviceProfile = {
+      rasterizer: this.rasterizer,
+      pixelRatio: this.requestedPixelRatio,
+      pixels: Math.max(
+        1,
+        this.cssWidth * this.requestedPixelRatio * this.cssHeight * this.requestedPixelRatio,
+      ),
+      ...(typeof navigator !== "undefined" && navigator.hardwareConcurrency > 0
+        ? { cores: navigator.hardwareConcurrency }
+        : {}),
+      ...(typeof navigator !== "undefined" &&
+      typeof (navigator as { deviceMemory?: number }).deviceMemory === "number"
+        ? { memoryGb: (navigator as { deviceMemory?: number }).deviceMemory }
+        : {}),
+      ...(this.adapterInfo?.architecture !== undefined
+        ? { architecture: this.adapterInfo.architecture.toLowerCase() }
+        : {}),
+      ...(this.adapterInfo?.vendor !== undefined
+        ? { vendor: this.adapterInfo.vendor.toLowerCase() }
+        : {}),
+    };
+    return Math.min(initialQualityIndex(profile), ceilingForOptions(this.options.lod));
+  }
+
+  /**
+   * Put one rung into force. Idempotent, and cheap when nothing moved.
+   *
+   * The budget and the screen error go through the same setters a caller would
+   * use, so there is exactly one path that changes them. The render scale is
+   * the only one that needs a resize, and it only takes one when the number
+   * actually changed — a `setSize` per frame would reallocate the depth and
+   * accumulation buffers per frame.
+   */
+  private applyQuality(index: number, auto: boolean): void {
+    const next = clampIndex(index);
+    if (next === this.qualityIndex) return;
+    this.qualityIndex = next;
+    const level = QUALITY_LEVELS[next]!;
+    this.lodOptions.pointBudget = level.pointBudget;
+    this.lodOptions.targetScreenError = level.targetScreenError;
+    if (level.renderScale !== this.renderScale) {
+      this.renderScale = level.renderScale;
+      if (this.initialized) this.applySize();
+    }
+    this.dirty = true;
+    this.onQuality?.(level, next, auto);
   }
 
   /**
@@ -2186,6 +2545,30 @@ export class PointCloudView {
     // black screen with nothing in the console.
     if (this.lostInfo !== undefined) return false;
     const t0 = performance.now();
+    // THE PRESENTED INTERVAL, and it is measured here rather than around the
+    // draw because the draw is not what the user waits for. `frameMs` below is
+    // CPU time and reads 1-2 ms on a machine that is dropping half its frames;
+    // the gap between one `renderFrame` and the next is the rate the display
+    // actually served, which is the only quantity that knows the difference
+    // between a renderer with headroom and one without.
+    //
+    // It is fed BEFORE this frame's work so the interval it reports is the one
+    // that has already been presented, not one that is still being built.
+    //
+    // NOT WHILE THE CLOUD IS STILL CONVERGING. `pendingAttach` is decoded nodes
+    // queued for their turn at the per-frame upload budget, and a frame that
+    // spends that budget is slow for a reason no rung can fix: the bytes have
+    // to reach the GPU whatever quality is asked for. Measured on nijmegen at
+    // a 2x ratio, the four seconds where the backlog drains read 21 fps while
+    // the steady state either side of them reads 30 and 40 — so a controller
+    // that counted those frames would walk two rungs down to fix a problem
+    // that was about to fix itself, and then need five seconds and a clean run
+    // to earn each one back.
+    if (this.auto !== undefined && this.lastFrameAt > 0 && this.stats.pendingAttach === 0) {
+      const decision = this.auto.sample(t0 - this.lastFrameAt, t0);
+      if (decision.changed) this.applyQuality(decision.index, true);
+    }
+    this.lastFrameAt = t0;
     this.frame++;
     // Camera motion, detected from the world matrix rather than announced by
     // the app: a viewer embedded behind React or Vue has no reliable place to
@@ -2513,26 +2896,55 @@ export class PointCloudView {
       h.lastSeen.set(h.selection.indices[k]!, now);
     }
 
-    // Cancel work the camera has moved past, but only when the queue is full.
+    // CANCELLATION, two tiers, and the difference between them is fact versus
+    // guess. See `stream-policy.ts`, which owns the rule and the measurements.
     //
-    // A fetch nothing is competing with is cheaper to finish than to redo: its
-    // bytes are already partly paid for, and the node may well be selected
-    // again. Under saturation the trade flips — a slot held by a node nobody is
-    // looking at is a slot the node on screen is waiting for.
-    if (this.abortSuperseded && h.inFlight.size >= this.maxConcurrent) {
+    //  - The node's box left the FRUSTUM: cancel. Its bytes cannot change a
+    //    pixel until the camera turns back, so the slot — and on a thin uplink
+    //    the share of the pipe — belongs to a node that is on screen.
+    //  - The SCHEDULER stopped selecting it while it is still in front of the
+    //    camera: only under saturation, only after eight frames, and only when
+    //    the caller asked. Those nodes come back.
+    //
+    // The walk is over `inFlight`, which is bounded by `maxConcurrent` — twelve
+    // boxes against six planes, not a traversal.
+    if (this.abortOutsideFrustum || this.abortSuperseded) {
+      const saturated = h.inFlight.size >= this.maxConcurrent;
+      // Only the frustum tier reads a box, and only when it is enabled at all.
+      const planes = h.scratch.planes;
       for (const [i, c] of h.inFlight) {
-        // STALE, not merely absent this frame.
-        //
-        // A node that left the selection one frame ago has usually not left at
-        // all: with damped controls the camera creeps for a dozen frames after
-        // a drag and nodes oscillate across the error threshold, so cancelling
-        // on first absence throws away work that is about to be wanted again.
-        // Measured, that cost 64 ms of INP — on the one Core Web Vital already
-        // behind — to save 0.5% of bytes. Requiring the node to stay gone tells
-        // a camera that has genuinely moved on from threshold jitter.
-        if (now - (h.lastSeen.get(i) ?? 0) < ABORT_STALE_FRAMES) continue;
+        const stale = now - (h.lastSeen.get(i) ?? 0);
+        // Short-circuits before `node(i)` for everything selected this frame,
+        // which under a still camera is every entry in the map.
+        if (stale <= 0) continue;
+        let outside = false;
+        if (this.abortOutsideFrustum) {
+          const box = h.hierarchy.node(i);
+          // A node whose box we cannot read is not one we can call off-screen.
+          outside =
+            box !== undefined &&
+            !intersectsAabb(
+              planes,
+              box.minX,
+              box.minY,
+              box.minZ,
+              box.maxX,
+              box.maxY,
+              box.maxZ,
+            );
+        }
+        if (
+          !shouldAbortFetch(outside, stale, {
+            abortOutsideFrustum: this.abortOutsideFrustum,
+            abortSuperseded: this.abortSuperseded,
+            saturated,
+          })
+        ) {
+          continue;
+        }
         c.abort();
         h.inFlight.delete(i);
+        this.stats.abortedLoads++;
       }
     }
 
@@ -2560,6 +2972,11 @@ export class PointCloudView {
       ) {
         continue;
       }
+      // Backing off from an earlier failure. Not a blacklist — the whole point
+      // is that it expires, so a node the network dropped once fills its hole
+      // on the retry instead of staying empty for the session.
+      const due = h.retryAt.get(i);
+      if (due !== undefined && now < due) continue;
       // Where the seam used to be. `hasPayload` is the driver's answer to
       // "does this node have bytes at all", which is a real question with three
       // different answers: 47 of autzen's nodes carry no payload of their own,
@@ -2576,6 +2993,9 @@ export class PointCloudView {
         .then((data) => {
           h.inFlight.delete(i);
           if (this.disposed) return;
+          // The node arrived, so whatever went wrong before did not stick.
+          h.attempts.delete(i);
+          h.retryAt.delete(i);
           // Queued, not staged: see CloudHandle.pending.
           h.pending.push({ index: i, data, level: node.level });
           h.queued.add(i);
@@ -2583,23 +3003,53 @@ export class PointCloudView {
         })
         .catch((err: unknown) => {
           h.inFlight.delete(i);
-          // An abort is US cancelling, not the node being unreadable, and it
-          // must never reach `failed` — that set is terminal by design, so
-          // blacklisting a node the camera merely panned away from would leave
-          // a permanent hole the moment it panned back.
+          // An abort is US cancelling, not the node being unreadable. It must
+          // never count as an attempt and never reach `failed`, or a camera
+          // that panned away would blacklist exactly the nodes it is about to
+          // pan back to.
           if (err instanceof Error && err.name === "AbortError") return;
-          // A real failure is terminal until something clears it — never a
-          // per-frame retry, which is exactly the reference's storm.
-          h.failed.add(i);
-          if (this.stats.lastError === undefined) {
-            this.stats.lastError = isVoxelkloudError(err)
-              ? `${err.code}: ${err.message}`
-              : String(err);
-          }
+          this.retryOrFail(h, i, isVoxelkloudError(err)
+            ? `${err.code}: ${err.message}`
+            : String(err));
         });
     }
 
-    if (h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0) > this.maxResidentBytes) this.evict(h);
+    if (h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0) > this.maxResidentBytes) {
+      this.evict(h);
+    } else {
+      this.stats.evictionStalled = false;
+    }
+  }
+
+  /**
+   * Book one failed load, and decide whether the node gets another go.
+   *
+   * THE HOLE THIS CLOSES. A node that is neither resident nor retriable is a
+   * region of the cloud with nothing in it, for as long as the page is open —
+   * and the failures that put it there are overwhelmingly transient: one CDN
+   * edge returning 503, a connection dropped mid-range-request, a sink with no
+   * room until the next eviction. Blacklisting on the first one converts a
+   * blip into permanent missing geometry, which is what "it loaded with holes
+   * and never filled them in" is.
+   *
+   * Terminal only after {@link MAX_LOAD_ATTEMPTS}, and backed off in between,
+   * so a URL that is going to 404 all day costs two extra requests once rather
+   * than sixty a second.
+   */
+  private retryOrFail(h: CloudHandle, i: number, message: string): void {
+    const attempts = (h.attempts.get(i) ?? 0) + 1;
+    h.attempts.set(i, attempts);
+    if (attempts >= MAX_LOAD_ATTEMPTS) {
+      h.failed.add(i);
+      h.retryAt.delete(i);
+      this.stats.failedNodes++;
+      this.stats.lastError ??= message;
+      return;
+    }
+    h.retryAt.set(i, nextRetryFrame(this.frame, attempts));
+    // A retry that nothing wakes up is a retry that never happens: under a
+    // still camera this is the only thing asking for another frame.
+    this.dirty = true;
   }
 
   /**
@@ -2624,6 +3074,14 @@ export class PointCloudView {
 
     let staged = 0;
     let n = 0;
+    /**
+     * Decoded nodes the sink had no room for, kept to be offered again.
+     *
+     * NEVER re-fetched: the bytes are already here and already decoded, and on
+     * the uplinks this library actually runs over, paying for them twice to
+     * fill the same hole is the expensive mistake.
+     */
+    let refused: CloudHandle["pending"] | undefined;
     while (n < h.pending.length && staged < this.maxAttachBytes) {
       const p = h.pending[n]!;
       n++;
@@ -2653,36 +3111,82 @@ export class PointCloudView {
       h.splatSink?.attach(p.index, p.data, pitch, p.level);
       if (bytes > 0) {
         h.resident.add(p.index);
+        h.attempts.delete(p.index);
         staged += bytes;
-      } else if (p.data.numPoints > 0) {
+      } else if (p.data.numPoints > 0 && !h.resident.has(p.index)) {
         // A refusal used to be doubly silent: nothing drew, and the node was
-        // still counted resident, so the HUD agreed everything was fine.
-        h.failed.add(p.index);
-        this.stats.lastError ??=
-          `sink refused ${p.data.nodeName} (${p.data.numPoints} points)`;
+        // still counted resident, so the HUD agreed everything was fine. It
+        // was then also terminal, which is worse — the commonest refusal is
+        // "no room right now", and the eviction that makes room happens two
+        // lines below. Hand it back to the sink on a later frame instead.
+        const attempts = (h.attempts.get(p.index) ?? 0) + 1;
+        h.attempts.set(p.index, attempts);
+        if (attempts >= MAX_LOAD_ATTEMPTS) {
+          h.failed.add(p.index);
+          this.stats.failedNodes++;
+          this.stats.lastError ??=
+            `sink refused ${p.data.nodeName} (${p.data.numPoints} points)`;
+        } else {
+          (refused ??= []).push(p);
+          h.queued.add(p.index);
+          // The refusal IS the signal that the resident set is over its
+          // working size, whatever `residentBytes` says — a slot-exhausted
+          // sink reports no bytes at all.
+          this.evict(h);
+          this.dirty = true;
+        }
       }
     }
     h.pending.splice(0, n);
+    // At the FRONT, not the back: `drainPending` sorts by `lastSeen` on every
+    // call, so position only decides this frame's order, and a node the camera
+    // is still looking at should be first to see the room eviction just freed.
+    if (refused !== undefined) h.pending.unshift(...refused);
     this.stats.residentPoints = h.sink.residentPoints + (h.splatSink?.residentPoints ?? 0);
     this.stats.pendingAttach = h.pending.length;
     if (h.pending.length > 0) this.dirty = true;
   }
 
-  /** Drop the least-recently-selected resident nodes, never the root. */
+  /**
+   * Drop the least-recently-selected resident nodes, never the root and never
+   * what this frame is about to draw.
+   *
+   * THE SELECTION IS OFF LIMITS, and that is the whole difference between a
+   * budget and a thrash. Ordering by `lastSeen` alone already puts the current
+   * selection last, so it is only ever reached when nothing else is left —
+   * which is exactly the state where evicting it detaches a node that the very
+   * next `stream` re-requests, to attach it by evicting its neighbour. The
+   * picture that produces is holes moving around the screen while the network
+   * stays busy, and it does not converge.
+   *
+   * Stopping there means `residentBytes` can sit above `maxResidentBytes`, by
+   * at most the working set — which `pointBudget` already bounds. That
+   * overshoot is reported through `evictionStalled` rather than paid for in
+   * missing geometry.
+   */
   private evict(h: CloudHandle): void {
+    const frame = this.frame;
     const candidates: Array<[number, number]> = [];
     for (const i of h.resident) {
       if (i === h.hierarchy.root.index) continue;
-      candidates.push([i, h.lastSeen.get(i) ?? 0]);
+      const seen = h.lastSeen.get(i) ?? 0;
+      if (seen >= frame) continue;
+      candidates.push([i, seen]);
     }
     candidates.sort((a, b) => a[1] - b[1]);
     const target = this.maxResidentBytes * 0.85;
+    const bytes = () =>
+      h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0);
     for (const [i] of candidates) {
-      if (h.sink.residentBytes + (h.splatSink?.residentBytes ?? 0) <= target) break;
+      if (bytes() <= target) break;
       h.sink.detach(i);
       h.splatSink?.detach(i);
       h.resident.delete(i);
     }
+    // Against the HARD ceiling, not the 0.85 target: dropping to 0.87 is the
+    // eviction hysteresis working, and only still being over the number the
+    // caller set is worth reporting.
+    this.stats.evictionStalled = bytes() > this.maxResidentBytes;
   }
 
   dispose(): void {
@@ -2719,13 +3223,6 @@ export class PointCloudView {
     this.gl = undefined;
   }
 }
-
-/**
- * Frames a node must stay out of the selection before its in-flight fetch is
- * cancelled. Eight is ~130 ms at 60 Hz — longer than damping's settle, shorter
- * than any deliberate camera move.
- */
-const ABORT_STALE_FRAMES = 8;
 
 export function createPointCloudView(
   options: PointCloudViewOptions,

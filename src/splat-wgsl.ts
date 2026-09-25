@@ -19,6 +19,14 @@ struct Uniforms {
   screenH  : f32,
   ignoreDepth : f32,
   _pad     : f32,
+  // Mirrors compute-wgsl.ts's zRange/clip fields in spirit (not offset --
+  // this struct is smaller): cloud-local, tested against center before any
+  // billboard offset, same as project()'s pre-projection clip test there.
+  zLo      : f32,
+  zHi      : f32,
+  clipCount : f32,
+  _pad2    : f32,
+  clip     : array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> u : Uniforms;
@@ -33,6 +41,23 @@ struct VertexOutput {
   @location(2) color : vec4<f32>,
 };
 
+// Cloud-local, pre-billboard — same semantics as compute-wgsl.ts's zOff()
+// and the clip-plane loop in project(), just evaluated per-splat instead of
+// per-point.
+fn culled(p : vec3<f32>) -> bool {
+  if (p.z < u.zLo || p.z > u.zHi) {
+    return true;
+  }
+  let nClip = u32(u.clipCount);
+  for (var ci : u32 = 0u; ci < nClip; ci = ci + 1u) {
+    let pl = u.clip[ci];
+    if (dot(pl.xyz, p) + pl.w < 0.0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 @vertex
 fn vs_main(
   @location(0) corner : vec2<f32>,
@@ -43,7 +68,13 @@ fn vs_main(
   @location(5) opacity : f32,
 ) -> VertexOutput {
   let worldPosition = center + axisU * corner.x + axisV * corner.y;
-  let clip = u.viewProj * vec4<f32>(worldPosition, 1.0);
+  var clip = u.viewProj * vec4<f32>(worldPosition, 1.0);
+  if (culled(center)) {
+    // Outside the [-w,w] clip volume on every axis with w > 0: hardware
+    // clipping drops it before rasterization, same effect as a discard but
+    // legal from a vertex stage.
+    clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+  }
   var out : VertexOutput;
   out.position = clip;
   out.eyeDepth = clip.w;

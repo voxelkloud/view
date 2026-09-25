@@ -1,13 +1,15 @@
 import { initialCapacity } from "./capacity.js";
 import type { DecodedPointData } from "@voxelkloud/format-potree";
 import type { Matrix4, PerspectiveCamera } from "three";
-import { COMPUTE_WGSL } from "./compute-wgsl.js";
+import { CLEAR_PIXELS_PER_THREAD, COMPUTE_WGSL } from "./compute-wgsl.js";
 import { DEVIATION_WGSL } from "./deviation-wgsl.js";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
 import { CLASS_ATTRIBUTE } from "./material-options.js";
 import type { PointReadback, PointSink } from "./sink.js";
 import { toZeroToOneDepth } from "./clip.js";
+import { GpuTimer } from "./gpu-timing.js";
+import type { GpuTimings } from "./gpu-timing.js";
 
 /** The index the shader switches on, in the order {@link ColorMode} declares. */
 const MODE_INDEX: Record<ColorMode["kind"], number> = {
@@ -46,6 +48,22 @@ export interface ComputeSinkOptions {
   readonly scalarRange: readonly [number, number];
   readonly background: readonly [number, number, number];
   readonly edl?: { readonly strength: number; readonly radius: number } | undefined;
+  /**
+   * Dispatch over DRAWN POINTS instead of over resident slots. Default off.
+   *
+   * The two passes launch one thread per slot below the allocator's extent,
+   * and that extent is the session's peak residency: a view holding a large
+   * cache to draw a small selection launches most of its threads to have them
+   * exit. Compact mode maps each thread onto a drawn point through a per-frame
+   * block table, so the dispatch is the point count the HUD reports.
+   *
+   * OFF BY DEFAULT, and the reason is provenance rather than doubt: it was
+   * written and unit-tested on a machine with no WebGPU, so no frame has ever
+   * been drawn through it. Turn it on, compare the image against the default
+   * path and watch `dispatchPoints` against `residentPoints`; the default
+   * changes when someone has done that.
+   */
+  readonly compactDispatch?: boolean;
 }
 
 interface Block {
@@ -152,6 +170,12 @@ export class ComputeRasterizer {
   private disposed = false;
 
   readonly module: GPUShaderModule;
+  /**
+   * GPU-side pass timing, when the device granted `timestamp-query` and the
+   * caller asked. `undefined` otherwise, and every call site is optional-chained
+   * so there is no disabled path to get wrong.
+   */
+  readonly timer: GpuTimer | undefined;
   /** Bumped whenever depth/accum are recreated, so sinks know to rebind. */
   get bufferGeneration(): number {
     return this.generation;
@@ -173,8 +197,16 @@ export class ComputeRasterizer {
       readonly edl?: { readonly strength: number; readonly radius: number } | undefined;
       /** Where non-error shader messages go. Shared with the view. */
       readonly warnings?: string[] | undefined;
+      /** Ask for pass timing. Ignored where the device has no query support. */
+      readonly timing?: boolean | undefined;
+      /** Frames between timing readbacks. 1 for a bench, 30 for a HUD. */
+      readonly timingEvery?: number | undefined;
     },
   ) {
+    this.timer =
+      options.timing === true && device.features.has("timestamp-query")
+        ? new GpuTimer(device, options.timingEvery ?? 30)
+        : undefined;
     this.module = device.createShaderModule({ code: COMPUTE_WGSL, label: "voxelkloud-compute" });
     collectShaderMessages(this.module, "compute", options.warnings);
     this.uniBuf = device.createBuffer({
@@ -258,10 +290,19 @@ export class ComputeRasterizer {
     this.uf[45] = o.background[2];
     this.device.queue.writeBuffer(this.uniBuf, 0, this.uniform);
     const enc = this.device.createCommandEncoder();
-    const cp = enc.beginComputePass();
+    // The accumulator, zeroed by the copy queue rather than by a thread per
+    // pixel. It is four u32 lanes of colour weight and its empty value is
+    // zero, so there is nothing for a kernel to decide — at 4K this took 33
+    // million atomic stores a frame and now takes one command.
+    enc.clearBuffer(this.accumBuf!);
+    const cp = enc.beginComputePass(
+      this.timer === undefined ? {} : { timestampWrites: this.timer.clearWrites() },
+    );
     cp.setBindGroup(0, this.bind!);
     cp.setPipeline(this.clearPipe);
-    cp.dispatchWorkgroups(Math.ceil(this.pixels / WORKGROUP));
+    cp.dispatchWorkgroups(
+      Math.ceil(this.pixels / (WORKGROUP * CLEAR_PIXELS_PER_THREAD)),
+    );
     cp.end();
     return enc;
   }
@@ -278,6 +319,7 @@ export class ComputeRasterizer {
       colorAttachments: [
         { view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } },
       ],
+      ...(this.timer === undefined ? {} : { timestampWrites: this.timer.resolveWrites() }),
     });
     rp.setPipeline(this.drawPipe);
     rp.setBindGroup(0, this.bind!);
@@ -304,12 +346,22 @@ export class ComputeRasterizer {
       overlay(op);
       op.end();
     }
+    // AFTER every pass is recorded and BEFORE the submit: the resolve is a
+    // command like any other and has to be in the same buffer as the queries
+    // it reads.
+    this.timer?.record(enc);
     this.device.queue.submit([enc.finish()]);
+    this.timer?.poll();
+  }
+
+  get timings(): GpuTimings | undefined {
+    return this.timer?.timings;
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.timer?.dispose();
     this.depthBuf?.destroy();
     this.accumBuf?.destroy();
     this.overlayDepth?.destroy();
@@ -340,6 +392,16 @@ export class BlockAllocator {
   get capacity(): number {
     return this.cap;
   }
+  /**
+   * Points inside LIVE ranges — what the resident nodes actually occupy.
+   *
+   * `used` is the extent a frame must cover and this is what it costs to hold.
+   * They were the same number until eviction started leaving holes, and the
+   * difference between them is the fragmentation.
+   */
+  get livePoints(): number {
+    return this.high - this.freePoints;
+  }
   get freeRunCount(): number {
     return this.free.length;
   }
@@ -367,6 +429,23 @@ export class BlockAllocator {
     if (next !== undefined && run.start + run.count === next.start) {
       run.count += next.count;
       free.splice(i + 1, 1);
+    }
+
+    // GIVE THE TAIL BACK. `high` is what every frame dispatches over — two
+    // compute passes launch one thread per slot below it, whether or not a
+    // live node is there — so a high-water that only ever rises makes the GPU
+    // cost of a frame the PEAK residency of the session rather than its
+    // current one. Orbit around a large cloud for a minute and the frame is
+    // still paying for the far side you have left.
+    //
+    // Only the tail, and only when it is already free: a hole in the middle
+    // cannot be reclaimed without moving a live range, and moving one would
+    // invalidate every `blocks` entry that addresses it. The runs are
+    // coalesced, so at most one can touch `high` and one check is enough.
+    const last = free[free.length - 1];
+    if (last !== undefined && last.start + last.count === this.high) {
+      this.high = last.start;
+      free.pop();
     }
   }
 
@@ -403,6 +482,69 @@ export class BlockAllocator {
   }
 }
 
+/** What one drawn node contributes to the visible-block table. */
+export interface VisibleBlock {
+  readonly start: number;
+  readonly count: number;
+  readonly level: number;
+}
+
+/** What {@link buildVisibleBlocks} wrote. */
+export interface VisibleBlockTable {
+  /** Table rows, each two u32 wide. */
+  entries: number;
+  /** Threads a compact dispatch must launch: every drawn point, once. */
+  points: number;
+  /** Deepest level drawn, for the cut's descent bound. */
+  deepest: number;
+  /** True when the table was cut short because `out` had no room. */
+  truncated: boolean;
+}
+
+/**
+ * Pack this frame's drawn nodes into `(firstSlot, firstOutputIndex)` pairs.
+ *
+ * PURE, AND SEPARATE FROM THE SINK, because it is the half of the compact
+ * dispatch that can be wrong without a GPU to tell you. Every thread of the
+ * frame maps itself through this table: a prefix that is off by one point
+ * silently reads a neighbouring node's position, which draws a plausible cloud
+ * with a few points in the wrong place — nothing throws, nothing goes black,
+ * and no counter disagrees.
+ *
+ * The rows come out in ASCENDING output order because that is what makes the
+ * shader's binary search legal. They are NOT in ascending slot order, and do
+ * not need to be: the search is over the output column.
+ */
+export function buildVisibleBlocks(
+  indices: Int32Array,
+  count: number,
+  blockFor: (index: number) => VisibleBlock | undefined,
+  out: Uint32Array,
+): VisibleBlockTable {
+  const capacity = out.length >>> 1;
+  let entries = 0;
+  let points = 0;
+  let deepest = 0;
+  let truncated = false;
+  for (let k = 0; k < count; k++) {
+    const block = blockFor(indices[k]!);
+    // A selected node with nothing attached yet is not an error — it is the
+    // ordinary state of a node still streaming — and it must not take a row,
+    // or the table would claim points that are not there.
+    if (block === undefined || block.count === 0) continue;
+    if (entries >= capacity) {
+      truncated = true;
+      break;
+    }
+    out[entries * 2] = block.start;
+    out[entries * 2 + 1] = points;
+    entries++;
+    points += block.count;
+    if (block.level > deepest) deepest = block.level;
+  }
+  return { entries, points, deepest, truncated };
+}
+
 /**
  * Point slots per u32 of `live`; the cap on distinct resident nodes.
  *
@@ -411,6 +553,86 @@ export class BlockAllocator {
  * do outro, sem erro nenhum. Um teste tranca a invariante.
  */
 export const MAX_SLOTS = 65_536;
+
+/**
+ * O slot que nunca está vivo, e o topo dos 16 bits reservado para ele.
+ *
+ * Um nó desanexado deixa os seus pontos escritos nos buffers: o alocador
+ * liberta o intervalo, mas os bytes só desaparecem quando outro nó os
+ * sobrescreve. Enquanto o slot de um nó era irrepetível, esses pontos órfãos
+ * apontavam para uma entrada de `live` que ficava a zero para sempre e o kernel
+ * rejeitava-os de graça. Reciclar o slot tira essa garantia — o órfão passaria
+ * a consultar a liveness do nó NOVO e a desenhar-se onde o antigo estava.
+ *
+ * Daí este sentinela. `detach` carimba-o sobre o `nmeta` do intervalo que
+ * libertou, e como `live[DEAD_SLOT]` nunca é escrito — nem pela CPU, nem pelo
+ * `commit`, e o buffer nasce a zero por garantia do WebGPU — o ponto órfão
+ * continua a ser rejeitado por uma entrada que ninguém pode acender.
+ */
+export const DEAD_SLOT = MAX_SLOTS - 1;
+
+/** O u32 de `nmeta` de um ponto órfão: nível 0, {@link DEAD_SLOT}, classe 0. */
+export const DEAD_META = (DEAD_SLOT & 0xffff) << 8;
+
+/**
+ * Os identificadores de slot, emprestados e devolvidos.
+ *
+ * Existe porque a contagem monótona que aqui estava era um vazamento com data
+ * marcada: `slotCount++` por cada `attach` e nada a descer, portanto uma sessão
+ * longa com churn de eviction — voar sobre Roterdão, voltar, voar outra vez —
+ * chega aos 65536 e o sink passa a recusar TUDO. A partir daí cada nó novo é um
+ * buraco, e a única pista era o desenho não aparecer.
+ *
+ * LIFO de propósito: o slot devolvido há menos tempo é aquele cujo intervalo de
+ * pontos o alocador tem mais hipóteses de reaproveitar a seguir, e reaproveitar
+ * os dois juntos é uma escrita em vez de duas.
+ */
+export class SlotPool {
+  private next = 0;
+  private readonly free: number[] = [];
+
+  /** @param capacity slots distintos, ids `0..capacity - 1`. */
+  constructor(private readonly capacity: number) {}
+
+  /** Um slot livre, ou `-1` quando não há — nunca lança. */
+  acquire(): number {
+    const reused = this.free.pop();
+    if (reused !== undefined) return reused;
+    if (this.next >= this.capacity) return -1;
+    return this.next++;
+  }
+
+  /**
+   * Devolve um slot ao pool. O CHAMADOR deve ter apagado antes toda a
+   * referência a ele nos buffers — ver {@link DEAD_SLOT}.
+   */
+  release(slot: number): void {
+    if (slot < 0 || slot >= this.capacity) return;
+    this.free.push(slot);
+  }
+
+  /**
+   * Um acima do maior slot já emprestado. É o limite que `live.fill` e o
+   * `commit` varrem: um slot nunca emprestado não tem pontos a consultá-lo.
+   */
+  get highWater(): number {
+    return this.next;
+  }
+
+  /** Emprestados neste momento. */
+  get used(): number {
+    return this.next - this.free.length;
+  }
+
+  get freeCount(): number {
+    return this.free.length;
+  }
+
+  reset(): void {
+    this.next = 0;
+    this.free.length = 0;
+  }
+}
 // 256 e não 192 desde a DEC-B6: os quatro planos de corte precisam de
 // alinhamento de 16 bytes, logo entram em 192 e o struct fecha em 256. Depois
 // veio a faixa de altura, um vec2 que só cabia DEPOIS do array de planos, e o
@@ -421,6 +643,9 @@ export const MAX_SLOTS = 65_536;
 // WGSL é obrigatório — um uniform mais curto que o struct dá layout inválido, e
 // o cabeçalho de `compute-wgsl` avisa que isso NÃO lança: os passes silenciam e
 // a tela fica preta com todos os contadores da CPU corretos.
+// FULL, to the byte: `naga` reports the WGSL `U` struct at exactly 352, with
+// `visCount` as the last member at offset 340. Another field does not fit —
+// raise this (in multiples of 16, the struct's alignment) at the same time.
 const UNIFORM_BYTES = 352;
 
 /**
@@ -515,13 +740,20 @@ export class ComputeSink implements PointSink {
   private devToScene: [number, number, number] = [0, 0, 0];
   private devMaxDistance = 5;
   private capacity: number;
-  private slotCount = 0;
+  private readonly slots = new SlotPool(DEAD_SLOT);
+  /**
+   * Palavras {@link DEAD_META}, reutilizadas entre `detach`es.
+   *
+   * Uma por ponto do maior intervalo já libertado. Cresce a dobrar e é
+   * preenchida uma única vez por crescimento — o conteúdo é constante, logo
+   * nada aqui é por-detach a não ser o `writeBuffer`.
+   */
+  private deadMeta = new Uint32Array(0);
   private grewTimes = 0;
   private growMs = 0;
 
   private posBuf: GPUBuffer;
   private colBuf: GPUBuffer;
-  private pitchBuf: GPUBuffer;
   private metaBuf: GPUBuffer;
   private readonly liveBuf: GPUBuffer;
   private readonly cutBuf: GPUBuffer;
@@ -532,7 +764,26 @@ export class ComputeSink implements PointSink {
   private colCpu: Uint8Array;
   private scalarCpu: Float32Array | undefined;
 
-  private readonly live = new Uint32Array(MAX_SLOTS);
+  /**
+   * TWO TABLES IN ONE BUFFER, split at {@link MAX_SLOTS}.
+   *
+   * Below the split: node liveness, one flag per slot — or, in compact mode,
+   * the visible-block table. Above it: each node's POINT PITCH, as f32 bits.
+   *
+   * The pitch lives here because it is a per-NODE quantity that used to be
+   * stored per POINT: `attach` allocated a `Float32Array(n)`, filled it with
+   * one number, and uploaded four bytes for every point in the node. At 26
+   * million resident points that is 104 MB of VRAM holding at most 65,536
+   * distinct values, a per-node JS allocation on the attach path, and a
+   * streamed read per point per pass where a 256 KB table stays in cache.
+   *
+   * Sharing the binding rather than taking a ninth is not thrift either: this
+   * shader sits exactly on `maxStorageBuffersPerShaderStage`, which WebGPU
+   * only guarantees at 8. Folding the pitch in here GIVES ONE BACK.
+   */
+  private readonly live = new Uint32Array(MAX_SLOTS * 2);
+  /** Reused for the one-slot pitch upload, so `attach` allocates nothing. */
+  private readonly pitchScratch = new Float32Array(1);
   private readonly uniform = new ArrayBuffer(UNIFORM_BYTES);
   private readonly uf = new Float32Array(this.uniform);
   private readonly uu = new Uint32Array(this.uniform);
@@ -549,6 +800,15 @@ export class ComputeSink implements PointSink {
   private readonly layout: GPUBindGroupLayout;
   private readonly depthPipe: GPUComputePipeline;
   private readonly colorPipe: GPUComputePipeline;
+  private readonly depthPipeCompact: GPUComputePipeline;
+  private readonly colorPipeCompact: GPUComputePipeline;
+  /** Whether THIS frame dispatches over drawn points rather than over slots. */
+  private compact: boolean;
+  /** Set once the table overflowed and the sink fell back for good. */
+  private compactRefused_ = false;
+  private visEntries = 0;
+  /** Points the last `setVisible` put on screen. Reported either way. */
+  private visPoints = 0;
   private boundGeneration = -1;
 
   private readonly mode: number;
@@ -613,12 +873,11 @@ export class ComputeSink implements PointSink {
     this.alloc = new BlockAllocator(this.capacity);
     this.posBuf = this.storage(this.capacity * 12);
     this.colBuf = this.storage(this.capacity * 4);
-    this.pitchBuf = this.storage(this.capacity * 4);
     this.metaBuf = this.storage(this.capacity * 4);
     this.posCpu = new Float32Array(this.capacity * 3);
     this.colCpu = new Uint8Array(this.capacity * 4);
     if (scalarAttribute !== undefined) this.scalarCpu = new Float32Array(this.capacity);
-    this.liveBuf = this.storage(MAX_SLOTS * 4);
+    this.liveBuf = this.storage(MAX_SLOTS * 2 * 4);
     this.cutBuf = this.storage(Math.max(4, cut.bytes.byteLength));
     this.uniBuf = device.createBuffer({
       size: UNIFORM_BYTES,
@@ -643,9 +902,11 @@ export class ComputeSink implements PointSink {
     const ro = { type: "read-only-storage" } as const;
     const rw = { type: "storage" } as const;
     const C = GPUShaderStage.COMPUTE;
-    // All nine, because `depthPass` and `colorPass` touch all nine — which is
-    // also exactly the WebGPU guarantee for storage buffers per stage, and why
-    // level and node slot share one u32 instead of taking a binding each.
+    // SEVEN storage buffers now, against the eight WebGPU guarantees per stage.
+    // It was exactly eight until the pitch lane — a per-point array holding a
+    // per-node constant — folded into the liveness table at binding 8. Level
+    // and node slot still share one u32; that was what bought the last slot
+    // before this one, and it is still worth having.
     this.layout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, buffer: ro },
@@ -653,7 +914,9 @@ export class ComputeSink implements PointSink {
         { binding: 2, visibility: C, buffer: rw },
         { binding: 3, visibility: C, buffer: rw },
         { binding: 4, visibility: C, buffer: { type: "uniform" } },
-        { binding: 5, visibility: C, buffer: ro },
+        // No binding 5: the pitch lane folded into the liveness buffer at
+        // binding 8, which took this shader off the eight-storage-buffer
+        // ceiling it was sitting exactly on.
         { binding: 6, visibility: C, buffer: ro },
         { binding: 7, visibility: C, buffer: ro },
         { binding: 8, visibility: C, buffer: ro },
@@ -669,11 +932,38 @@ export class ComputeSink implements PointSink {
       device.createComputePipeline({ layout: pl, compute: { module: raster.module, entryPoint } });
     this.depthPipe = compute("depthPass");
     this.colorPipe = compute("colorPass");
+    this.depthPipeCompact = compute("depthPassCompact");
+    this.colorPipeCompact = compute("colorPassCompact");
+    this.compact = options.compactDispatch === true;
   }
 
   /** The largest point count whose position buffer still binds as storage. */
+  /**
+   * The most points this sink may ever hold, and there are TWO ceilings.
+   *
+   * The binding one is the familiar one: positions are 12 B and the whole lane
+   * is bound as a single storage buffer, so `maxStorageBufferBindingSize`
+   * divided by 12 is where the bind group stops validating. `init` asks the
+   * adapter for its maximum precisely so this number is large.
+   *
+   * The DISPATCH one is the ceiling this cap exists for. A frame launches one
+   * thread per slot at `WORKGROUP` threads a group, and
+   * `maxComputeWorkgroupsPerDimension` is 65,535 on every implementation —
+   * it is the WebGPU spec's default and nothing here requests more. Past
+   * 65,535 x 256 = 16,776,960 slots the dispatch is a validation error, which
+   * is the worst failure this file can produce: the pass records nothing, the
+   * canvas goes black, and every CPU counter still reads correct because the
+   * scheduler, the streamer and the sink all did their jobs. Capping capacity
+   * turns that into the refusal path, which the view already knows how to
+   * report.
+   */
   private maxBindablePoints(): number {
-    return Math.floor(this.device.limits.maxStorageBufferBindingSize / 12);
+    const byBinding = Math.floor(
+      this.device.limits.maxStorageBufferBindingSize / 12,
+    );
+    const byDispatch =
+      this.device.limits.maxComputeWorkgroupsPerDimension * WORKGROUP;
+    return Math.min(byBinding, byDispatch);
   }
 
   private storage(bytes: number): GPUBuffer {
@@ -834,13 +1124,85 @@ export class ComputeSink implements PointSink {
     return this.devToScene;
   }
 
+  /** Points in live ranges. NOT the dispatch extent — see {@link dispatchPoints}. */
   get residentPoints(): number {
-    return this.alloc.used;
+    return this.alloc.livePoints;
   }
 
-  /** Capacity, not live points: this is what the GPU is actually holding. */
+  /**
+   * Bytes the resident nodes occupy.
+   *
+   * LIVE POINTS, not capacity, and the difference is the whole reason
+   * eviction works. This is the number the view compares against
+   * `maxResidentBytes`, and while it reported CAPACITY that comparison was
+   * against a constant: capacity is reserved up front from the point budget
+   * and only ever rises, so the test either never fired or fired on every
+   * frame for ever. Both halves of that were wrong in the same direction —
+   * nothing was evicted until the sink had already grown past the ceiling, and
+   * then everything outside the current selection was evicted every frame
+   * because the number could not come back down.
+   *
+   * What the GPU is holding is {@link capacityBytes}, which is a different
+   * question with a different answer.
+   */
   get residentBytes(): number {
-    return this.capacity * (this.scalarCpu === undefined ? 20 : 24);
+    return this.alloc.livePoints * this.bytesPerPoint;
+  }
+
+  /**
+   * Bytes the sink has RESERVED, live or not.
+   *
+   * Always at or above {@link residentBytes}; the gap is the free list plus the
+   * unreached tail of the capacity.
+   */
+  get capacityBytes(): number {
+    return this.capacity * this.bytesPerPoint;
+  }
+
+  /**
+   * GPU bytes per point: position at 12, colour at 4, metadata at 4, plus the
+   * scalar lane when there is one.
+   *
+   * It now matches what is allocated. It did not before: the pitch lane was a
+   * fourth per-point buffer and this number never counted it, so every report
+   * of resident bytes was four per point light — and that number is what the
+   * view's eviction compares against its ceiling. Moving the pitch to a
+   * per-node table removed the lane rather than the discrepancy, which is the
+   * better way to make two numbers agree.
+   */
+  private get bytesPerPoint(): number {
+    return this.scalarCpu === undefined ? 20 : 24;
+  }
+
+  /**
+   * Threads one compute pass launches — what the frame actually costs.
+   *
+   * In the default mode it is the allocator's extent, holes and undrawn nodes
+   * included, and it sits above {@link residentPoints} by exactly the
+   * fragmentation. Watch the ratio: a frame whose `dispatchPoints` is far
+   * above the points on screen is paying for geometry it is not drawing.
+   *
+   * With `compactDispatch` on it IS the points on screen, which is the whole
+   * point of that option.
+   */
+  get dispatchPoints(): number {
+    return this.compact ? this.visPoints : this.alloc.used;
+  }
+
+  /**
+   * Whether the compact dispatch is running.
+   *
+   * False when it was never asked for, and false after the block table
+   * overflowed once — which is permanent, because the condition that
+   * overflowed it is a selection size and selections do not shrink for long.
+   */
+  get compactDispatch(): boolean {
+    return this.compact;
+  }
+
+  /** True once a compact frame fell back. Diagnostics: it should never happen. */
+  get compactRefused(): boolean {
+    return this.compactRefused_;
   }
 
   get nodeCount(): number {
@@ -879,7 +1241,6 @@ export class ComputeSink implements PointSink {
     };
     this.posBuf = copy(this.posBuf, 12);
     this.colBuf = copy(this.colBuf, 4);
-    this.pitchBuf = copy(this.pitchBuf, 4);
     this.metaBuf = copy(this.metaBuf, 4);
     const pos = new Float32Array(cap * 3);
     pos.set(this.posCpu);
@@ -911,16 +1272,21 @@ export class ComputeSink implements PointSink {
     // else would need a rebase this sink deliberately does not do, because the
     // reader already produced the right frame for the arena.
     if (!(data.positions instanceof Float32Array)) return 0;
-    if (this.slotCount >= MAX_SLOTS) return 0;
+    // ANTES de alocar pontos: um slot em falta recusa o nó na mesma, e alocar
+    // primeiro deixaria o intervalo preso a um bloco que nunca existe.
+    const slot = this.slots.acquire();
+    if (slot < 0) return 0;
 
     const n = data.numPoints;
     let start = this.alloc.allocate(n);
     if (start < 0) {
       this.grow(this.alloc.used + n);
       start = this.alloc.allocate(n);
-      if (start < 0) return 0;
+      if (start < 0) {
+        this.slots.release(slot);
+        return 0;
+      }
     }
-    const slot = this.slotCount++;
     this.blocks.set(index, { start, count: n, slot, level });
 
     const q = this.device.queue;
@@ -964,8 +1330,10 @@ export class ComputeSink implements PointSink {
       }
     }
 
-    const pitch = new Float32Array(n).fill(spacingWorld);
-    q.writeBuffer(this.pitchBuf, start * 4, gpuData(pitch));
+    // ONE float for the whole node, at its slot. This was `n` floats.
+    this.pitchScratch[0] = spacingWorld;
+    this.live[MAX_SLOTS + slot] = new Uint32Array(this.pitchScratch.buffer)[0]!;
+    q.writeBuffer(this.liveBuf, (MAX_SLOTS + slot) * 4, gpuData(this.pitchScratch));
 
     // A classe é lida à parte do escalar de propósito: no modo classificação os
     // dois são o mesmo atributo, mas em RGB ou intensidade o escalar é outro —
@@ -982,31 +1350,93 @@ export class ComputeSink implements PointSink {
     if (block === undefined) return;
     this.alloc.release(block.start, block.count);
     this.blocks.delete(index);
-    // The SLOT is retired, never reused, and that is what makes detaching free:
-    // the freed points keep pointing at a slot whose `live` entry stays 0
-    // forever, so a frame rejects them without rewriting a byte of point data.
-    // Reusing slot ids would mean scrubbing the freed range on every detach.
-    this.live[block.slot] = 0;
+    // Only in flag mode. In compact mode this array is the block table and
+    // `block.slot` addresses a row of it, so clearing it here would blank a
+    // different node's start or prefix. The table is rebuilt from scratch
+    // every `setVisible`, so there is nothing to clear there either.
+    if (!this.compact) this.live[block.slot] = 0;
+    // O CARIMBO QUE TORNA A RECICLAGEM SEGURA. Os pontos deste bloco ficam
+    // escritos até outro nó os sobrescrever, e são exactamente os pontos de
+    // `[start, start + count)` — um slot pertence a um bloco de cada vez, e um
+    // bloco é contíguo. Carimbar {@link DEAD_SLOT} por cima apaga a última
+    // referência ao slot, e só então ele pode voltar ao pool.
+    //
+    // Custa 4 B por ponto contra os 20 B que o `attach` escreveu, e o `attach`
+    // que reaproveita o intervalo escreve-o outra vez por cima — é o preço de
+    // não ter um teto de 65536 nós por sessão.
+    this.scrubMeta(block.start, block.count);
+    this.slots.release(block.slot);
+  }
+
+  /** Carimba {@link DEAD_META} sobre `[start, start + count)` do `nmeta`. */
+  private scrubMeta(start: number, count: number): void {
+    // Um sink já destruído não tem buffer para escrever, e não precisa: o
+    // `nmeta` foi-se com ele.
+    if (this.disposed || count === 0) return;
+    if (this.deadMeta.length < count) {
+      let cap = Math.max(this.deadMeta.length, 4096);
+      while (cap < count) cap *= 2;
+      this.deadMeta = new Uint32Array(cap).fill(DEAD_META);
+    }
+    this.device.queue.writeBuffer(
+      this.metaBuf,
+      start * 4,
+      gpuData(this.deadMeta),
+      0,
+      count,
+    );
   }
 
   setVisible(indices: Int32Array, count: number): void {
-    this.live.fill(0, 0, this.slotCount);
+    if (this.compact) {
+      const table = buildVisibleBlocks(
+        indices,
+        count,
+        (i) => this.blocks.get(i),
+        this.live,
+      );
+      this.visEntries = table.entries;
+      this.visPoints = table.points;
+      // Falling back rather than drawing a short frame: a truncated table
+      // draws the first N nodes and drops the rest, which is a cloud with a
+      // piece missing and no way to tell from inside. The flag path costs a
+      // wasted dispatch and draws everything.
+      if (table.truncated) {
+        this.compact = false;
+        this.compactRefused_ = true;
+        this.setVisible(indices, count);
+        return;
+      }
+      this.cutDepth = table.deepest + 1;
+      return;
+    }
+    this.live.fill(0, 0, this.slots.highWater);
     // The cut is only as deep as the DRAWN set, so the shader's descent stops
     // where the data does instead of walking levels no node reached.
     let deepest = 0;
+    let points = 0;
     for (let i = 0; i < count; i++) {
       const block = this.blocks.get(indices[i]!);
       if (block === undefined) continue;
       this.live[block.slot] = 1;
+      points += block.count;
       if (block.level > deepest) deepest = block.level;
     }
+    this.visPoints = points;
     this.cutDepth = deepest + 1;
   }
 
   commit(): void {
     if (this.disposed) return;
     const q = this.device.queue;
-    q.writeBuffer(this.liveBuf, 0, gpuData(this.live), 0, Math.max(1, this.slotCount));
+    // TWO LAYOUTS, one buffer. In compact mode binding 8 is the visible-block
+    // table and only the rows written this frame matter; otherwise it is one
+    // flag per node slot and the whole high-water range has to go, because a
+    // stale 1 past the end would draw a node that was evicted.
+    const words = this.compact
+      ? Math.max(1, this.visEntries * 2)
+      : Math.max(1, this.slots.highWater);
+    q.writeBuffer(this.liveBuf, 0, gpuData(this.live), 0, words);
     const bytes = this.cut.entryCount * 4;
     if (bytes > 0 && bytes <= this.cutBuf.size) {
       q.writeBuffer(this.cutBuf, 0, gpuData(this.cut.bytes), 0, bytes);
@@ -1039,7 +1469,6 @@ export class ComputeSink implements PointSink {
         { binding: 2, resource: { buffer: depth } },
         { binding: 3, resource: { buffer: accum } },
         { binding: 4, resource: { buffer: this.uniBuf } },
-        { binding: 5, resource: { buffer: this.pitchBuf } },
         { binding: 6, resource: { buffer: this.metaBuf } },
         { binding: 7, resource: { buffer: this.cutBuf } },
         { binding: 8, resource: { buffer: this.liveBuf } },
@@ -1144,11 +1573,12 @@ export class ComputeSink implements PointSink {
     this.uf.set(m.elements, 0);
     this.uf[16] = width;
     this.uf[17] = height;
-    // The high-water mark, not the live count: a free list scatters live nodes,
-    // so the frame covers everything resident and rejects per point. That is
-    // the instanced arm's draw-to-high-water model exactly, one dispatch
-    // instead of one draw.
-    this.uu[18] = this.alloc.used;
+    // WHAT THE DISPATCH COVERS, and the two answers differ by the whole
+    // fragmentation. In the default mode it is the allocator's extent: a free
+    // list scatters live nodes, so the frame covers everything resident and
+    // rejects per point. In compact mode it is the drawn points themselves,
+    // and each thread reaches its slot through the block table.
+    this.uu[18] = this.compact ? this.visPoints : this.alloc.used;
     this.uu[19] = 1;
     this.uf[20] = camera.projectionMatrix.elements[5]!;
     this.uf[21] = o.sizeMultiplier;
@@ -1190,6 +1620,7 @@ export class ComputeSink implements PointSink {
     // que uma mat4x4 exige -- por isso ela entrou aqui sem deslocar nada.
     this.uf.set(this.photoMatrix, 68);
     this.uf[84] = this.photoTex === undefined ? 0 : this.photoMix;
+    this.uu[85] = this.visEntries;
     const e = modelMatrix.elements;
     for (let i = 0; i < nPlanes; i++) {
       const nx = planes![i * 4]!;
@@ -1204,12 +1635,21 @@ export class ComputeSink implements PointSink {
     }
     this.device.queue.writeBuffer(this.uniBuf, 0, this.uniform);
 
-    const groups = Math.ceil(this.alloc.used / WORKGROUP);
-    const cp = enc.beginComputePass();
+    const threads = this.compact ? this.visPoints : this.alloc.used;
+    // Nothing drawn is a real frame: a cloud whose whole selection is still
+    // streaming has no visible block at all, and dispatching zero groups is
+    // legal but pointless.
+    if (threads === 0) return;
+    const groups = Math.ceil(threads / WORKGROUP);
+    const cp = enc.beginComputePass(
+      this.raster.timer === undefined
+        ? {}
+        : { timestampWrites: this.raster.timer.pointsWrites() },
+    );
     cp.setBindGroup(0, this.bind);
-    cp.setPipeline(this.depthPipe);
+    cp.setPipeline(this.compact ? this.depthPipeCompact : this.depthPipe);
     cp.dispatchWorkgroups(groups);
-    cp.setPipeline(this.colorPipe);
+    cp.setPipeline(this.compact ? this.colorPipeCompact : this.colorPipe);
     cp.dispatchWorkgroups(groups);
     cp.end();
   }
@@ -1226,7 +1666,6 @@ export class ComputeSink implements PointSink {
     for (const b of [
       this.posBuf,
       this.colBuf,
-      this.pitchBuf,
       this.metaBuf,
       this.liveBuf,
       this.cutBuf,
@@ -1236,5 +1675,6 @@ export class ComputeSink implements PointSink {
     }
     this.blocks.clear();
     this.alloc.reset();
+    this.slots.reset();
   }
 }

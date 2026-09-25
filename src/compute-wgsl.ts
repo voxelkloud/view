@@ -12,6 +12,16 @@
  * invalid and every pass silently no-ops, which renders a black frame while
  * every CPU-side counter stays correct.
  */
+/**
+ * Pixels one `clearPass` thread clears. Must match the loop in the kernel.
+ *
+ * It exists so the dispatch and the kernel cannot drift: a stride of four in
+ * one and a divisor of one in the other leaves three quarters of the screen
+ * holding the previous frame's depth, which reads as the cloud refusing to
+ * refine rather than as a clear bug.
+ */
+export const CLEAR_PIXELS_PER_THREAD = 4;
+
 export const COMPUTE_WGSL = `
 struct U {
   clipFromCloud : mat4x4<f32>,
@@ -65,6 +75,10 @@ struct U {
   // comum paga, em vez de um bind group diferente por causa de uma feature que
   // a maioria das cenas nao usa.
   photoMix  : f32,
+  // Entries in the visible-block table, and ONLY read by the compact passes.
+  // It lands in what was padding at the end of the block, so every offset
+  // above it is where it was.
+  visCount  : u32,
 };
 
 @group(0) @binding(0) var<storage, read>       pos   : array<f32>;
@@ -72,7 +86,6 @@ struct U {
 @group(0) @binding(2) var<storage, read_write> depth : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> accum : array<atomic<u32>>;
 @group(0) @binding(4) var<uniform>             u     : U;
-@group(0) @binding(5) var<storage, read>       pitch : array<f32>;
 // Level in the low 8 bits, owning node slot in the next 16, ASPRS class in the
 // top 8. The slot only ever needs 16 because MAX_SLOTS is 65536, so the class
 // rides in bits that were already allocated and cost nothing — which is the
@@ -81,8 +94,22 @@ struct U {
 // Per cut slot: child mask in the low 8 bits, first-child slot in the high 24,
 // the same bytes 'OctreeCut' feeds the instanced material's DataTexture.
 @group(0) @binding(7) var<storage, read>       cut   : array<u32>;
-// Whether each node is in THIS frame's draw list, indexed by the slot in nmeta.
+// TWO TABLES, split at PITCH_BASE. Below: whether each node is in THIS frame's
+// draw list, indexed by the slot in 'nmeta' — or, for the compact entry points,
+// the visible-block table. Above: each node's point pitch as f32 bits.
+//
+// The pitch was a per-POINT lane at binding 5 holding a per-NODE constant, so
+// it cost four bytes and a streamed read per point to say something 65,536
+// numbers could say. Folding it here freed that binding, and this shader was
+// sitting exactly on the eight storage buffers WebGPU guarantees.
 @group(0) @binding(8) var<storage, read>       live  : array<u32>;
+// Must match MAX_SLOTS in 'sink-compute.ts'. A mismatch reads a liveness flag
+// as a pitch, which draws splats a few billion times too wide or exactly zero.
+const PITCH_BASE : u32 = 65536u;
+
+fn pitchOfSlot(slot : u32) -> f32 {
+  return bitcast<f32>(live[PITCH_BASE + slot]);
+}
 
 // A foto e o seu sampler. NAO sao storage buffers: o limite que este shader ja
 // toca -- 'maxStorageBuffersPerShaderStage', garantido em 8 e onde ele esta
@@ -117,9 +144,9 @@ const UNKNOWN_CLASS = vec3<f32>(0.0, 0.85, 0.8);
 
 // O SLOT do nó dono, em 16 bits. O byte de topo do 'nmeta' carrega a classe, e
 // um '>> 8u' cru traria a classe junto e indexaria 'live' fora do nó certo.
-fn slotOf(i : u32) -> u32 {
-  return (nmeta[i] >> 8u) & 0xffffu;
-}
+// Inlined at both entry points so the metadata word is loaded once; kept here
+// as the single written statement of the layout.
+//   slot = (nmeta_i >> 8u) & 0xffffu
 
 // A classe deste ponto está desligada? Vale em TODOS os modos de cor: o código
 // viaja no byte de topo do 'nmeta', não no 'col' que muda de significado com o
@@ -127,9 +154,9 @@ fn slotOf(i : u32) -> u32 {
 // Ambos os passes chamam isto: um ponto escondido que ainda escrevesse
 // profundidade seguiria ocluindo o que está atrás dele — invisível, mas
 // presente, que é pior que um bug visível.
-fn classOff(i : u32) -> bool {
+fn classOffMeta(nmeta_i : u32) -> bool {
   if (u.classHidden == 0u) { return false; }
-  let code = nmeta[i] >> 24u;
+  let code = nmeta_i >> 24u;
   let bit = select(31u, code, code <= 18u);
   return ((u.classHidden >> bit) & 1u) == 1u;
 }
@@ -182,7 +209,7 @@ struct Splat { ok : bool, x : i32, y : i32, d : u32, r : f32, p : f32 };
 const FILTER_INV = 1.0204;   // 1 / (2 * 0.7^2)
 const FILTER_FLOOR = 0.004;
 
-fn project(i : u32) -> Splat {
+fn projectMeta(i : u32, nmeta_i : u32) -> Splat {
   var s : Splat;
   s.ok = false;
   let p = vec4<f32>(pos[i * 3u], pos[i * 3u + 1u], pos[i * 3u + 2u], 1.0);
@@ -206,6 +233,8 @@ fn project(i : u32) -> Splat {
   // 2**(D-L) too wide everywhere behind the frontier, painting over finer data
   // already on the GPU.
   var shrink : u32 = 0u;
+  // READ BEFORE THE WALK, because it BOUNDS the walk. See the break below.
+  let myLevel = nmeta_i & 0xffu;
   if (u.useCut == 1u) {
     var slot : u32 = 0u;
     var bMin = u.rootMin;
@@ -227,19 +256,26 @@ fn project(i : u32) -> Splat {
       let cz = select(0u, 1u, p.z >= mid.z);
       let idx = cx * 4u + cy * 2u + cz;
       if ((mask & (1u << idx)) == 0u) { break; }
-      var below : u32 = 0u;
-      for (var b : u32 = 0u; b < idx; b = b + 1u) {
-        below = below + ((mask >> b) & 1u);
-      }
+      // Siblings ahead of this octant, as ONE instruction instead of a loop of
+      // up to seven. Identical by construction: the mask below bit 'idx' is
+      // exactly the set the loop was counting.
+      let below = countOneBits(mask & ((1u << idx) - 1u));
       slot = first + below;
       bMin = bMin + vec3<f32>(f32(cx), f32(cy), f32(cz)) * half;
       bSize = half;
       d2 = d2 + 1u;
+      // STOP AS SOON AS THE ANSWER IS DECIDED. The shrink below is capped at
+      // ONE level, so the only question this walk answers is whether a
+      // selected node one level below this point's own exists here. Once
+      // 'd2' passes 'myLevel' that is settled, and every further descent is a
+      // dependent load into a buffer nobody will read the result of. On a
+      // level-2 point under a level-8 cut that is six of nine iterations,
+      // each one a cache miss.
+      if (d2 > myLevel) { break; }
     }
     // Never shallower than the point's own node: a drawn point's ancestors are
     // all selected, so a shallower answer is float32 ambiguity at a split
     // plane, and clamping degrades it to per-node sizing rather than a blob.
-    let myLevel = nmeta[i] & 0xffu;
     // MEASURED CAP OF ONE LEVEL, and the number is not taste.
     //
     // The cut says "the deepest resident node here is at depth D", and shrinking
@@ -262,7 +298,11 @@ fn project(i : u32) -> Splat {
     if (d2 > myLevel) { shrink = min(d2 - myLevel, 1u); }
   }
   let projFactor = 0.5 * u.screen.y * u.p11 / c.w;
-  let localPitch = pitch[i] / exp2(f32(shrink));
+  // 'shrink' is 0 or 1 and nothing else — the cap above sees to that — so this
+  // is a halving, not a general power. 0.5 is exact in binary, so the value is
+  // bit-identical to the transcendental it replaces.
+  let nodePitch = pitchOfSlot((nmeta_i >> 8u) & 0xffffu);
+  let localPitch = select(nodePitch, nodePitch * 0.5, shrink == 1u);
   s.r = clamp(localPitch * 2.0 * u.sizeMul * projFactor, u.minPx, u.maxPx) * 0.5;
   // The pitch the cut actually resolved, in WORLD units, which is what the
   // colour pass needs to decide whether two points are one surface.
@@ -336,25 +376,69 @@ fn shade(i : u32, z : f32) -> vec3<f32> {
   return photoOver(i, baseShade(i, z));
 }
 
+// DEPTH ONLY, and four pixels to a thread.
+//
+// NO BACKTICKS ANYWHERE IN THIS FILE'S COMMENTS: the whole shader is one JS
+// template literal, and a backtick ends it. The failure is a parse error three
+// hundred lines away with nothing to say about shaders.
+//
+// The accumulator used to be cleared here too — four more atomic stores per
+// pixel, 33 million of them at 4K — and it did not need to be: clearing it
+// means writing zeros to a whole buffer, which is what clearBuffer does, and
+// the copy queue does it without launching a thread. Depth cannot go the same
+// way because its empty value is FLT_MAX rather than zero.
+//
+// The stride of four is what keeps the dispatch inside
+// maxComputeWorkgroupsPerDimension. At one pixel per thread a 16.8-megapixel
+// canvas needs more than the 65,535 groups every implementation allows, and
+// over that line the pass is a validation error: nothing clears, and the
+// previous frame's depth rejects every point in this one.
 @compute @workgroup_size(256)
 fn clearPass(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= u32(u.screen.x) * u32(u.screen.y)) { return; }
-  atomicStore(&depth[i], 0x7f7fffffu);  // FLT_MAX
-  let base = i * 4u;
-  atomicStore(&accum[base + 0u], 0u);
-  atomicStore(&accum[base + 1u], 0u);
-  atomicStore(&accum[base + 2u], 0u);
-  atomicStore(&accum[base + 3u], 0u);
+  let n = u32(u.screen.x) * u32(u.screen.y);
+  let base = gid.x * 4u;
+  for (var k = 0u; k < 4u; k = k + 1u) {
+    let i = base + k;
+    if (i < n) { atomicStore(&depth[i], 0x7f7fffffu); }  // FLT_MAX
+  }
 }
 
-@compute @workgroup_size(256)
-fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= u.count) { return; }
-  if (live[slotOf(i)] == 0u) { return; }
-  if (classOff(i) || zOff(i)) { return; }
-  let s = project(i);
+// THE COMPACT DISPATCH, and what binding 8 means when it is running.
+//
+// The ordinary passes launch one thread per RESIDENT slot and throw away the
+// ones whose node is not drawn this frame. That is the right shape while
+// resident and drawn are close, and the wrong one as soon as they are not: the
+// allocator's extent is the peak the session ever reached, so a view holding a
+// 26-million-point cache to draw 3 million launches nine threads for every one
+// that does anything, twice a frame.
+//
+// In compact mode the same buffer carries a VISIBLE BLOCK TABLE instead of one
+// flag per node slot: pairs of (first point slot, first output index), one per
+// drawn node, in ascending output order. A thread binary-searches for its
+// block and maps itself onto a slot, so the dispatch is exactly the drawn
+// point count and every thread has work. The search is at most log2(4096) = 12
+// iterations of an L1-resident lookup, against a cut walk that is already up
+// to twenty with a popcount in each.
+//
+// It reuses binding 8 rather than adding one because this shader sits exactly
+// on 'maxStorageBuffersPerShaderStage', which WebGPU only guarantees at 8. The
+// reuse is safe because the two meanings are never live at once: a pipeline is
+// built from one entry point or the other, and the sink writes whichever
+// layout that pipeline reads.
+fn slotForThread(t : u32) -> u32 {
+  var lo = 0u;
+  var hi = u.visCount - 1u;
+  loop {
+    if (lo >= hi) { break; }
+    let mid = (lo + hi + 1u) >> 1u;
+    if (live[mid * 2u + 1u] <= t) { lo = mid; } else { hi = mid - 1u; }
+  }
+  return live[lo * 2u] + (t - live[lo * 2u + 1u]);
+}
+
+fn writeDepth(i : u32, nmeta_i : u32) {
+  if (classOffMeta(nmeta_i) || zOff(i)) { return; }
+  let s = projectMeta(i, nmeta_i);
   if (!s.ok) { return; }
   let ri = i32(ceil(s.r - 0.5));
   let r2 = s.r * s.r;
@@ -363,7 +447,16 @@ fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var dy = -ri; dy <= ri; dy = dy + 1) {
     let y = s.y + dy;
     if (y < 0 || y >= H) { continue; }
-    for (var dx = -ri; dx <= ri; dx = dx + 1) {
+    // THE ROW'S OWN HALF-WIDTH, not the bounding square's. A square scan with
+    // a circle test inside it throws away the corners one pixel at a time —
+    // 1 - pi/4, so a fifth of every iteration, and at the row nearest the top
+    // of the splat almost all of them. The bound is rounded UP and the test
+    // below is kept, so the set of pixels written is exactly the set the
+    // square scan wrote; only the iterations that were going to fail are gone.
+    let rem = r2 - f32(dy * dy);
+    if (rem < 0.0) { continue; }
+    let dxMax = min(ri, i32(ceil(sqrt(rem))));
+    for (var dx = -dxMax; dx <= dxMax; dx = dx + 1) {
       let x = s.x + dx;
       if (x < 0 || x >= W) { continue; }
       if (f32(dx * dx + dy * dy) > r2) { continue; }
@@ -373,12 +466,30 @@ fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
-fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
+fn depthPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u.count) { return; }
-  if (live[slotOf(i)] == 0u) { return; }
-  if (classOff(i) || zOff(i)) { return; }
-  let s = project(i);
+  // ONE load of this point's metadata word, reused for the liveness slot, the
+  // class test and the node level. It was read three times: once here, once in
+  // 'classOff' and once inside 'project'. Whether a compiler folds three reads
+  // of a read-only storage buffer across three function bodies is a question
+  // about that compiler, and this is not a question worth having.
+  let nmeta_i = nmeta[i];
+  if (live[(nmeta_i >> 8u) & 0xffffu] == 0u) { return; }
+  writeDepth(i, nmeta_i);
+}
+
+@compute @workgroup_size(256)
+fn depthPassCompact(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= u.count) { return; }
+  let i = slotForThread(t);
+  writeDepth(i, nmeta[i]);
+}
+
+fn writeColor(i : u32, nmeta_i : u32) {
+  if (classOffMeta(nmeta_i) || zOff(i)) { return; }
+  let s = projectMeta(i, nmeta_i);
   if (!s.ok) { return; }
   let rgb = shade(i, pos[i * 3u + 2u]) * 255.0;
   let cr = u32(clamp(rgb.x, 0.0, 255.0));
@@ -391,7 +502,12 @@ fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var dy = -ri; dy <= ri; dy = dy + 1) {
     let y = s.y + dy;
     if (y < 0 || y >= H) { continue; }
-    for (var dx = -ri; dx <= ri; dx = dx + 1) {
+    // Same bound as the depth pass, for the same reason and with the same
+    // guarantee: a superset of the circle, with the exact test still inside.
+    let rem = r2 - f32(dy * dy);
+    if (rem < 0.0) { continue; }
+    let dxMax = min(ri, i32(ceil(sqrt(rem))));
+    for (var dx = -dxMax; dx <= dxMax; dx = dx + 1) {
       let x = s.x + dx;
       if (x < 0 || x >= W) { continue; }
       let d2 = f32(dx * dx + dy * dy);
@@ -417,6 +533,23 @@ fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
       atomicAdd(&accum[base + 3u], wi);
     }
   }
+}
+
+@compute @workgroup_size(256)
+fn colorPass(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= u.count) { return; }
+  let nmeta_i = nmeta[i];
+  if (live[(nmeta_i >> 8u) & 0xffffu] == 0u) { return; }
+  writeColor(i, nmeta_i);
+}
+
+@compute @workgroup_size(256)
+fn colorPassCompact(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= u.count) { return; }
+  let i = slotForThread(t);
+  writeColor(i, nmeta[i]);
 }
 
 struct VOut { @builtin(position) pos : vec4<f32> };

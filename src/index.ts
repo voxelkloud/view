@@ -27,7 +27,47 @@ export type { PointCloudMaterial } from "./material.js";
 export type { EdlOptions, EdlPipeline, ResolvedEdlOptions } from "./edl.js";
 
 export { OctreeCut } from "./cut.js";
-export { BlockAllocator, ComputeRasterizer, ComputeSink } from "./sink-compute.js";
+export { GpuTimer } from "./gpu-timing.js";
+export type { GpuPassTiming, GpuTimings } from "./gpu-timing.js";
+// Automatic quality. The ladder and the controller are exported so a host can
+// build its own menu against the same names the engine uses, rather than
+// hard-coding a list that drifts out of step with the levels.
+export {
+  AUTO_CEILING_INDEX,
+  DEFAULT_QUALITY_INDEX,
+  QUALITY_LEVELS,
+  QualityController,
+  ceilingForOptions,
+  initialQualityIndex,
+  resolveQualityIndex,
+} from "./quality.js";
+export type {
+  DeviceProfile,
+  QualityControllerOptions,
+  QualityDecision,
+  QualityLevel,
+} from "./quality.js";
+// The streaming policy: which in-flight fetch to cancel, and when a failed
+// node gets another go. Pure, like `lod/`, and exported because the constants
+// are the answer to "why did my node get cancelled" and because a caller
+// tuning `abortOutsideFrustum` wants to read them.
+export {
+  ABORT_OUTSIDE_FRAMES,
+  ABORT_STALE_FRAMES,
+  MAX_LOAD_ATTEMPTS,
+  nextRetryFrame,
+  retryDelayFrames,
+  shouldAbortFetch,
+} from "./stream-policy.js";
+export type { AbortPolicy } from "./stream-policy.js";
+export {
+  BlockAllocator,
+  ComputeRasterizer,
+  ComputeSink,
+  DEAD_META,
+  DEAD_SLOT,
+  SlotPool,
+} from "./sink-compute.js";
 export type { ComputeSinkOptions } from "./sink-compute.js";
 export { CloudFrame, PointCloudObject3D } from "./object.js";
 export type { CloudPlacement, Vec3Out } from "./object.js";

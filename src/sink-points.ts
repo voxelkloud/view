@@ -4,7 +4,15 @@ import type { Matrix4, PerspectiveCamera } from "three";
 import type { OctreeCut } from "./cut.js";
 import type { ColorMode } from "./material.js";
 import { FS, FS_EDL, VS, VS_POST } from "./points-glsl.js";
-import { BlockAllocator, MAX_SLOTS, Z_RANGE_OFF, packNodeMeta } from "./sink-compute.js";
+import {
+  BlockAllocator,
+  DEAD_META,
+  DEAD_SLOT,
+  MAX_SLOTS,
+  SlotPool,
+  Z_RANGE_OFF,
+  packNodeMeta,
+} from "./sink-compute.js";
 import { CLASS_ATTRIBUTE } from "./material-options.js";
 import type { PointReadback, PointSink } from "./sink.js";
 
@@ -88,7 +96,14 @@ export class PointsSink implements PointSink {
   private readonly blocks = new Map<number, { start: number; count: number; slot: number; level: number }>();
   private readonly alloc: BlockAllocator;
   private capacity: number;
-  private slotCount = 0;
+  /**
+   * Ver {@link SlotPool}. O braço GL sofria do mesmo vazamento que o de compute
+   * e mais depressa: este sink evicta por conta própria em `evictOne`, portanto
+   * o churn de slots é o funcionamento normal e não o caso extremo.
+   */
+  private readonly slots = new SlotPool(DEAD_SLOT);
+  /** Ver {@link ComputeSink}: palavras {@link DEAD_META} reaproveitadas. */
+  private deadMeta = new Uint32Array(0);
   private refusedNodes = 0;
   private evictedNodes = 0;
   private grewTimes = 0;
@@ -287,7 +302,7 @@ export class PointsSink implements PointSink {
   private evictOne(): boolean {
     let victim = -1;
     let oldest = this.frameNo;
-    for (let slot = 0; slot < this.slotCount; slot++) {
+    for (let slot = 0; slot < this.slots.highWater; slot++) {
       if (this.nodeOfSlot[slot] === undefined) continue;
       if (this.lastLive[slot]! >= this.frameNo) continue;
       if (this.lastLive[slot]! < oldest) {
@@ -300,11 +315,13 @@ export class PointsSink implements PointSink {
     const b = this.blocks.get(nodeIndex)!;
     this.alloc.release(b.start, b.count);
     this.blocks.delete(nodeIndex);
-    // The SLOT is retired, never reused: the freed points keep pointing at a
-    // slot whose `live` byte stays 0 forever, so a frame rejects them without
-    // rewriting a byte of point data.
     this.nodeOfSlot[victim] = undefined;
     this.live[victim] = 0;
+    // Carimbar antes de devolver — ver {@link DEAD_SLOT}. Sem isto os pontos
+    // que acabaram de ser libertados consultariam a liveness do nó que vier a
+    // herdar o slot.
+    this.scrubMeta(b.start, b.count);
+    this.slots.release(victim);
     this.evictedNodes++;
     return true;
   }
@@ -321,7 +338,8 @@ export class PointsSink implements PointSink {
   private attachInner(index: number, data: DecodedPointData, spacingWorld: number, level: number): number {
     if (this.disposed || this.blocks.has(index) || data.numPoints === 0) return 0;
     if (!(data.positions instanceof Float32Array)) return 0;
-    if (this.slotCount >= MAX_SLOTS) {
+    const slot = this.slots.acquire();
+    if (slot < 0) {
       this.refusedNodes++;
       return 0;
     }
@@ -345,6 +363,7 @@ export class PointsSink implements PointSink {
         continue;
       }
       if (this.capacity * 2 > (1 << 26)) {
+        this.slots.release(slot);
         this.refusedNodes++;
         return 0;
       }
@@ -353,9 +372,11 @@ export class PointsSink implements PointSink {
     }
 
     const gl = this.gl;
-    const slot = this.slotCount++;
-    this.nodeOfSlot.push(index);
-    this.lastLive.push(this.frameNo);
+    // Indexado pelo slot, não empilhado: com o pool a reciclar, o slot que sai
+    // do `acquire` pode ser um do meio e um `push` desalinharia as duas tabelas
+    // de tudo o resto.
+    this.nodeOfSlot[slot] = index;
+    this.lastLive[slot] = this.frameNo;
     this.blocks.set(index, { start, count: n, slot, level });
     if (level > this.maxLevel) this.maxLevel = level;
 
@@ -421,11 +442,26 @@ export class PointsSink implements PointSink {
     this.blocks.delete(index);
     this.nodeOfSlot[b.slot] = undefined;
     this.live[b.slot] = 0;
+    this.scrubMeta(b.start, b.count);
+    this.slots.release(b.slot);
+  }
+
+  /** Carimba {@link DEAD_META} sobre `[start, start + count)` do atributo meta. */
+  private scrubMeta(start: number, count: number): void {
+    if (this.disposed || count === 0) return;
+    if (this.deadMeta.length < count) {
+      let cap = Math.max(this.deadMeta.length, 4096);
+      while (cap < count) cap *= 2;
+      this.deadMeta = new Uint32Array(cap).fill(DEAD_META);
+    }
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.metaBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, start * 4, this.deadMeta, 0, count);
   }
 
   setVisible(indices: Int32Array, count: number): void {
     this.frameNo++;
-    this.live.fill(0, 0, this.slotCount);
+    this.live.fill(0, 0, this.slots.highWater);
     let deepest = 0;
     for (let i = 0; i < count; i++) {
       const b = this.blocks.get(indices[i]!);
@@ -443,7 +479,7 @@ export class PointsSink implements PointSink {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.liveTex);
     gl.texSubImage2D(
-      gl.TEXTURE_2D, 0, 0, 0, LIVE_W, Math.max(1, Math.ceil(this.slotCount / LIVE_W)),
+      gl.TEXTURE_2D, 0, 0, 0, LIVE_W, Math.max(1, Math.ceil(this.slots.highWater / LIVE_W)),
       gl.RED_INTEGER, gl.UNSIGNED_BYTE, this.live, 0,
     );
     if (this.cut.entryCount > 0) {
